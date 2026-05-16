@@ -19,9 +19,10 @@ from config.constants import (
     MIN_PRICE, MAX_PRICE, PRICE_LEVELS, N_PRICE_ACTIONS,
     INITIAL_INVENTORY, MAX_INVENTORY, RESTOCK_QTY, REORDER_POINT,
     UNIT_COST, HOLDING_COST, STOCKOUT_PENALTY,
-    BASE_DEMAND, PRICE_ELASTICITY, SEASONALITY_AMPLITUDE, 
+    BASE_DEMAND, PRICE_ELASTICITY, SEASONALITY_AMPLITUDE,
     SEASONALITY_PERIOD, DEMAND_NOISE_STD,
-    EPISODE_LENGTH, REWARD_SCALE, RANDOM_SEED
+    EPISODE_LENGTH, REWARD_SCALE, RANDOM_SEED,
+    DEFAULT_PRODUCT_CATEGORY,
 )
 
 
@@ -52,14 +53,20 @@ class PricingEnv(gym.Env):
     
     def __init__(
         self,
-        demand_predictor=None,  # Optional: ML model for demand prediction
+        demand_predictor=None,  # DemandPredictorWrapper or compatible
+        product_category: str = DEFAULT_PRODUCT_CATEGORY,
         render_mode: Optional[str] = None,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
     ):
         super().__init__()
-        
+
         self.demand_predictor = demand_predictor
+        self.product_category = product_category
         self.render_mode = render_mode
+
+        # Calendar state for ML demand model (updated each step)
+        self.day_of_week = 0
+        self.month = 1
         
         # Action space: discrete price levels
         self.action_space = spaces.Discrete(N_PRICE_ACTIONS)
@@ -128,10 +135,23 @@ class PricingEnv(gym.Env):
         If demand_predictor is provided, uses ML model instead.
         """
         if self.demand_predictor is not None:
-            # Use ML model if available
-            # This would be implemented based on your trained model
-            features = np.array([[price, self.current_day % 7, self.current_day]])
-            demand = self.demand_predictor.predict(features)[0]
+            if hasattr(self.demand_predictor, "predict_demand"):
+                demand = self.demand_predictor.predict_demand(
+                    price=price,
+                    day_of_week=self.day_of_week,
+                    month=self.month,
+                    category=self.product_category,
+                )
+            else:
+                # Legacy sklearn-style model (no category support)
+                features = np.array([[
+                    price,
+                    self.day_of_week,
+                    self.month,
+                    int(self.day_of_week >= 5),
+                    int(self.month in [11, 12]),
+                ]])
+                demand = self.demand_predictor.predict(features)[0]
         else:
             # Simple analytical demand model
             base = BASE_DEMAND
@@ -196,10 +216,23 @@ class PricingEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         
+        options = options or {}
+
         # Reset episode state
         self.current_day = 0
-        self.current_price_idx = options.get("initial_price_idx", N_PRICE_ACTIONS // 2) if options else N_PRICE_ACTIONS // 2
-        self.inventory = options.get("initial_inventory", INITIAL_INVENTORY) if options else INITIAL_INVENTORY
+        self.current_price_idx = options.get("initial_price_idx", N_PRICE_ACTIONS // 2)
+        self.inventory = options.get("initial_inventory", INITIAL_INVENTORY)
+        # Random calendar start when using ML demand (more diverse episodes)
+        if self.demand_predictor is not None:
+            self.day_of_week = int(
+                options.get("day_of_week", self._rng.integers(0, 7))
+            ) % 7
+            self.month = int(options.get("month", self._rng.integers(1, 13)))
+        else:
+            self.day_of_week = int(options.get("day_of_week", 0)) % 7
+            self.month = int(options.get("month", 1))
+        if options.get("product_category"):
+            self.product_category = options["product_category"]
         self.total_revenue = 0.0
         self.total_profit = 0.0
         
@@ -266,9 +299,12 @@ class PricingEnv(gym.Env):
         self.history["profits"].append(reward / REWARD_SCALE)
         self.history["inventory"].append(self.inventory)
         
-        # Advance day
+        # Advance calendar and day counter
         self.current_day += 1
-        
+        self.day_of_week = (self.day_of_week + 1) % 7
+        if self.current_day > 0 and self.current_day % 30 == 0:
+            self.month = (self.month % 12) + 1
+
         # Check termination
         terminated = self.current_day >= EPISODE_LENGTH
         truncated = False  # We don't truncate early in this version

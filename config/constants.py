@@ -8,21 +8,33 @@ from pathlib import Path
 # Project Paths
 PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
+RAW_DATA_DIR = DATA_DIR / "raw"
+PROCESSED_DATA_DIR = DATA_DIR / "processed"
+SYNTHETIC_DATA_DIR = DATA_DIR / "synthetic"
 MODELS_DIR = PROJECT_ROOT / "models"
 LOGS_DIR = PROJECT_ROOT / "logs"
 
+# Dataset filenames
+RAW_SALES_FILENAME = "ecommerce_dynamic_pricing_dataset.csv"
+PROCESSED_SALES_FILENAME = "processed_sales.csv"
+SYNTHETIC_SALES_FILENAME = "synthetic_sales.csv"
+
+RAW_SALES_PATH = RAW_DATA_DIR / RAW_SALES_FILENAME
+PROCESSED_SALES_PATH = PROCESSED_DATA_DIR / PROCESSED_SALES_FILENAME
+SYNTHETIC_SALES_PATH = SYNTHETIC_DATA_DIR / SYNTHETIC_SALES_FILENAME
+
 # Ensure directories exist
-for dir_path in [DATA_DIR, MODELS_DIR, LOGS_DIR]:
-    dir_path.mkdir(exist_ok=True)
+for dir_path in [RAW_DATA_DIR, PROCESSED_DATA_DIR, SYNTHETIC_DATA_DIR, MODELS_DIR, LOGS_DIR]:
+    dir_path.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
 # PRICING CONFIGURATION
 # =============================================================================
 
-# Price range (in your currency, e.g., USD)
-MIN_PRICE = 10.0
-MAX_PRICE = 100.0
-PRICE_STEP = 5.0  # Discrete price levels
+# Price range — calibrated from processed_sales.csv (avg_price p5–p95)
+MIN_PRICE = 25.0
+MAX_PRICE = 975.0
+PRICE_STEP = 25.0  # Discrete price levels (~39 actions)
 
 # Calculate discrete price levels
 PRICE_LEVELS = [round(p, 2) for p in 
@@ -31,8 +43,8 @@ PRICE_LEVELS = [round(p, 2) for p in
 
 N_PRICE_ACTIONS = len(PRICE_LEVELS)
 
-# Cost per unit (for profit calculation)
-UNIT_COST = 5.0
+# Cost per unit (for profit calculation; ~10–15% of typical selling price)
+UNIT_COST = 75.0
 
 # =============================================================================
 # INVENTORY CONFIGURATION
@@ -57,11 +69,26 @@ HOLDING_COST = 0.5
 STOCKOUT_PENALTY = 10.0
 
 # =============================================================================
+# PRODUCT / DEMAND DATA CONFIGURATION
+# =============================================================================
+
+# Categories in processed_sales.csv (global demand model)
+PRODUCT_CATEGORIES = [
+    "Books",
+    "Clothing",
+    "Electronics",
+    "Home & Kitchen",
+]
+
+# Default category when running RL env or predictions without specifying one
+DEFAULT_PRODUCT_CATEGORY = "Books"
+
+# =============================================================================
 # DEMAND MODEL CONFIGURATION
 # =============================================================================
 
-# Base demand (intercept in demand function)
-BASE_DEMAND = 50.0
+# Base demand (fallback analytical model; processed data ~0–5 units/day)
+BASE_DEMAND = 2.0
 
 # Price elasticity (how demand changes with price)
 # Negative value: higher price = lower demand
@@ -174,5 +201,5 @@ DASHBOARD_PORT = 8501
 
 # Default simulation parameters for dashboard
 DASHBOARD_DEFAULT_EPISODE_DAYS = 30
-DASHBOARD_DEFAULT_INITIAL_PRICE = 50.0
+DASHBOARD_DEFAULT_INITIAL_PRICE = 400.0
 DASHBOARD_DEFAULT_INITIAL_INVENTORY = 100

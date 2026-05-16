@@ -1,21 +1,17 @@
 """
-Streamlit Dashboard for RL Dynamic Pricing System.
+Streamlit Dashboard — RL Dynamic Pricing
 
-Interactive interface for:
-- Testing pricing strategies
-- Visualizing training results
-- Monitoring agent performance
-- Comparing RL vs baseline strategies
+Interactive web UI using the trained LightGBM demand model and PPO agent.
 
-Run with:
+Run:
     streamlit run dashboard/streamlit_app.py
 """
 
+from __future__ import annotations
+
 import sys
 from pathlib import Path
-
-# Add project root to path
-sys.path.append(str(Path(__file__).parent.parent))
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -24,411 +20,630 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from environment.pricing_env import PricingEnv
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from config.constants import (
-    PRICE_LEVELS, N_PRICE_ACTIONS, EPISODE_LENGTH,
-    MIN_PRICE, MAX_PRICE, DASHBOARD_TITLE,
-    DASHBOARD_DEFAULT_EPISODE_DAYS,
-    DASHBOARD_DEFAULT_INITIAL_PRICE,
     DASHBOARD_DEFAULT_INITIAL_INVENTORY,
-    MODELS_DIR
+    DASHBOARD_TITLE,
+    DEFAULT_PRODUCT_CATEGORY,
+    EPISODE_LENGTH,
+    LOGS_DIR,
+    MAX_PRICE,
+    MIN_PRICE,
+    MODELS_DIR,
+    N_PRICE_ACTIONS,
+    PRICE_LEVELS,
+    PRICE_STEP,
+    PRODUCT_CATEGORIES,
+    UNIT_COST,
+)
+from environment.pricing_env import PricingEnv
+from training.demand_features import (
+    METADATA_PATH,
+    MODEL_PATH,
+    DemandPredictorWrapper,
+    load_metadata,
 )
 
-# Page config
+# ---------------------------------------------------------------------------
+# Page config & styling
+# ---------------------------------------------------------------------------
+
 st.set_page_config(
     page_title=DASHBOARD_TITLE,
     page_icon="💰",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# Title
-st.title(f"💰 {DASHBOARD_TITLE}")
-st.markdown("---")
+st.markdown(
+    """
+    <style>
+    .metric-card {
+        background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
+        padding: 1rem 1.25rem;
+        border-radius: 10px;
+        color: #f0f4f8;
+    }
+    .status-ok { color: #3dd68c; font-weight: 600; }
+    .status-miss { color: #f0ad4e; font-weight: 600; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
+DEFAULT_PPO_PATH = MODELS_DIR / "best_model" / "best_model.zip"
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+MONTH_NAMES = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+]
+
+
+# ---------------------------------------------------------------------------
+# Model loaders (cached)
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner="Loading PPO agent...")
+def load_ppo_model(path: str):
+    from stable_baselines3 import PPO
+    return PPO.load(path)
+
+
+@st.cache_resource(show_spinner="Loading demand predictor...")
+def load_demand_model():
+    return DemandPredictorWrapper.load()
+
+
+def price_to_index(price: float) -> int:
+    return int(np.argmin(np.abs(np.array(PRICE_LEVELS) - price)))
+
+
+def make_simulation_env(
+    demand_predictor: Optional[DemandPredictorWrapper],
+    category: str,
+    seed: int,
+) -> PricingEnv:
+    return PricingEnv(
+        demand_predictor=demand_predictor,
+        product_category=category,
+        seed=seed,
+    )
+
+
+def run_episode(
+    env: PricingEnv,
+    policy: Callable,
+    n_days: int,
+    reset_options: dict,
+    seed: int,
+) -> tuple[pd.DataFrame, dict]:
+    obs, info = env.reset(seed=seed, options=reset_options)
+    for _ in range(n_days):
+        action = policy(obs, env)
+        obs, _, terminated, truncated, info = env.step(int(action))
+        if terminated or truncated:
+            break
+    return env.get_history_df(), info
+
+
+def build_demand_curve(
+    predictor: DemandPredictorWrapper,
+    category: str,
+    day_of_week: int,
+    month: int,
+    prices: np.ndarray,
+) -> pd.DataFrame:
+    rows = []
+    for p in prices:
+        d = predictor.predict_demand(p, day_of_week, month, category)
+        rows.append({"price": p, "predicted_demand": max(0.0, d)})
+    return pd.DataFrame(rows)
+
+
+def find_training_logs() -> list[Path]:
+    if not LOGS_DIR.exists():
+        return []
+    return sorted(LOGS_DIR.glob("ppo_pricing_*/evaluations.npz"), reverse=True)
+
+
+# ---------------------------------------------------------------------------
 # Sidebar
-st.sidebar.header("Configuration")
+# ---------------------------------------------------------------------------
 
-# Navigation
+st.sidebar.title("⚙️ Control panel")
+
 page = st.sidebar.radio(
-    "Select Page",
-    ["🏠 Home", "🎮 Interactive Simulation", "📊 Strategy Comparison", "📈 Training Analysis"]
+    "Navigation",
+    [
+        "🏠 Overview",
+        "🎮 Live simulation",
+        "🔮 What-if explorer",
+        "📊 Strategy comparison",
+        "📈 Training metrics",
+    ],
 )
 
-# Model loading
 st.sidebar.markdown("---")
-st.sidebar.subheader("Model")
-use_trained_model = st.sidebar.checkbox("Use Trained PPO Model", value=False)
+st.sidebar.subheader("Models")
 
-model = None
-if use_trained_model:
+ppo_path = st.sidebar.text_input(
+    "PPO model path",
+    value=str(DEFAULT_PPO_PATH),
+)
+use_ppo = st.sidebar.checkbox("Use trained PPO", value=True)
+
+category = st.sidebar.selectbox(
+    "Product category",
+    PRODUCT_CATEGORIES,
+    index=PRODUCT_CATEGORIES.index(DEFAULT_PRODUCT_CATEGORY),
+)
+
+use_ml_demand = st.sidebar.checkbox(
+    "Use LightGBM demand model",
+    value=True,
+    help="When enabled, demand follows the trained predictor instead of the analytical formula.",
+)
+
+ppo_model = None
+demand_predictor = None
+demand_meta = {}
+
+if use_ppo and Path(ppo_path).exists():
     try:
-        from stable_baselines3 import PPO
-        model_path = st.sidebar.text_input(
-            "Model Path",
-            value=str(MODELS_DIR / "best_model" / "best_model.zip")
+        ppo_model = load_ppo_model(ppo_path)
+        st.sidebar.markdown('<p class="status-ok">✓ PPO loaded</p>', unsafe_allow_html=True)
+    except Exception as exc:
+        st.sidebar.markdown(f'<p class="status-miss">✗ PPO: {exc}</p>', unsafe_allow_html=True)
+elif use_ppo:
+    st.sidebar.markdown('<p class="status-miss">✗ PPO file not found</p>', unsafe_allow_html=True)
+
+if use_ml_demand and MODEL_PATH.exists():
+    try:
+        demand_predictor = load_demand_model()
+        if METADATA_PATH.exists():
+            demand_meta = load_metadata()
+        st.sidebar.markdown('<p class="status-ok">✓ Demand model loaded</p>', unsafe_allow_html=True)
+    except Exception as exc:
+        st.sidebar.markdown(f'<p class="status-miss">✗ Demand: {exc}</p>', unsafe_allow_html=True)
+elif use_ml_demand:
+    st.sidebar.markdown('<p class="status-miss">✗ Demand model not found</p>', unsafe_allow_html=True)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Price grid: ${MIN_PRICE:.0f}–${MAX_PRICE:.0f} (step ${PRICE_STEP:.0f})")
+st.sidebar.caption(f"Unit cost: ${UNIT_COST:.0f} | Episode: {EPISODE_LENGTH} days")
+
+
+# ---------------------------------------------------------------------------
+# Overview
+# ---------------------------------------------------------------------------
+
+if page == "🏠 Overview":
+    st.title(f"💰 {DASHBOARD_TITLE}")
+    st.markdown(
+        "Interactive pricing lab powered by **LightGBM demand forecasting** "
+        "and a **PPO reinforcement-learning agent** trained on your e-commerce data."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Price actions", N_PRICE_ACTIONS)
+    c2.metric("Categories", len(PRODUCT_CATEGORIES))
+    c3.metric("Episode length", f"{EPISODE_LENGTH} d")
+    c4.metric("Demand model R²", f"{demand_meta.get('metrics', {}).get('r2', 0):.3f}" if demand_meta else "—")
+
+    st.markdown("---")
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("Pipeline")
+        st.markdown(
+            """
+            1. **Preprocess** transactions → `data/processed/processed_sales.csv`  
+            2. **Train demand** → LightGBM (global, per category)  
+            3. **Train PPO** → pricing policy in simulated market  
+            4. **Explore here** → simulate, what-if, compare strategies  
+            """
         )
-        if Path(model_path).exists():
-            model = PPO.load(model_path)
-            st.sidebar.success("Model loaded!")
-        else:
-            st.sidebar.warning("Model file not found. Using random policy.")
-    except Exception as e:
-        st.sidebar.error(f"Error loading model: {e}")
+
+    with right:
+        st.subheader("Model status")
+        status_rows = [
+            ("PPO agent", "Ready" if ppo_model else "Not loaded", ppo_path),
+            ("Demand predictor", "Ready" if demand_predictor else "Not loaded", str(MODEL_PATH)),
+            ("Active category", category, ""),
+        ]
+        st.table(pd.DataFrame(status_rows, columns=["Component", "Status", "Path"]))
+
+    st.info(
+        "Start with **Live simulation** to watch the PPO agent price over a month, "
+        "or **What-if explorer** to probe demand at different prices."
+    )
 
 
-# =============================================================================
-# HOME PAGE
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Live simulation
+# ---------------------------------------------------------------------------
 
-if page == "🏠 Home":
-    st.header("Welcome to RL Dynamic Pricing")
-    
-    col1, col2 = st.columns(2)
-    
+elif page == "🎮 Live simulation":
+    st.title("🎮 Live pricing simulation")
+    st.caption("Run a multi-day episode with the trained PPO policy and LightGBM demand.")
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.subheader("🎯 What is this?")
-        st.write("""
-        This system uses **Reinforcement Learning** to optimize product pricing 
-        in real-time. The RL agent (trained with PPO) learns to:
-        
-        - **Maximize revenue** by finding optimal price points
-        - **Manage inventory** to avoid stockouts
-        - **Adapt to demand patterns** like seasonality
-        - **Balance exploration** vs exploitation
-        
-        The agent makes pricing decisions each day, learning from 
-        customer responses (demand) to improve over time.
-        """)
-    
-    with col2:
-        st.subheader("🏗️ Architecture")
-        st.write("""
-        **Components:**
-        
-        1. **Pricing Environment** (`environment/`)
-           - Simulates market dynamics
-           - Tracks inventory and demand
-        
-        2. **PPO Agent** (`training/`)
-           - Learns optimal pricing policy
-           - Uses Stable-Baselines3
-        
-        3. **Demand Predictor** (`training/`)
-           - LightGBM model for forecasting
-           - Provides market insights
-        
-        4. **Dashboard** (`dashboard/`)
-           - This interactive interface
-           - Visualizes results
-        """)
-    
-    st.markdown("---")
-    
-    # Quick stats
-    st.subheader("📊 Quick Environment Stats")
-    
-    cols = st.columns(4)
-    cols[0].metric("Price Range", f"${MIN_PRICE} - ${MAX_PRICE}")
-    cols[1].metric("Price Levels", N_PRICE_ACTIONS)
-    cols[2].metric("Episode Length", f"{EPISODE_LENGTH} days")
-    cols[3].metric("Action Space", "Discrete")
-    
-    st.markdown("---")
-    
-    # Quick start
-    st.subheader("🚀 Quick Start")
-    st.write("""
-    1. **Train the demand predictor:**
-       ```bash
-       python -m training.train_demand_predictor
-       ```
-    
-    2. **Train the PPO agent:**
-       ```bash
-       python -m training.train_ppo --timesteps 100000
-       ```
-    
-    3. **Test in the Interactive Simulation tab** ← (click there now!)
-    """)
-
-
-# =============================================================================
-# INTERACTIVE SIMULATION
-# =============================================================================
-
-elif page == "🎮 Interactive Simulation":
-    st.header("Interactive Pricing Simulation")
-    
-    # Configuration
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        initial_price = st.slider(
-            "Initial Price ($)",
+        initial_price = st.number_input(
+            "Starting price ($)",
             min_value=float(MIN_PRICE),
             max_value=float(MAX_PRICE),
-            value=float(DASHBOARD_DEFAULT_INITIAL_PRICE),
-            step=5.0
+            value=400.0,
+            step=float(PRICE_STEP),
         )
-    
     with col2:
-        initial_inventory = st.slider(
-            "Initial Inventory",
+        initial_inventory = st.number_input(
+            "Initial inventory",
             min_value=10,
             max_value=500,
             value=DASHBOARD_DEFAULT_INITIAL_INVENTORY,
-            step=10
+            step=10,
         )
-    
     with col3:
-        simulation_days = st.slider(
-            "Simulation Days",
-            min_value=7,
-            max_value=90,
-            value=DASHBOARD_DEFAULT_EPISODE_DAYS
-        )
-    
-    # Run simulation
-    if st.button("▶️ Run Simulation", type="primary"):
-        with st.spinner("Running simulation..."):
-            # Create environment
-            env = PricingEnv(seed=42)
-            
-            # Find initial price index
-            price_idx = np.argmin(np.abs(np.array(PRICE_LEVELS) - initial_price))
-            
-            # Reset environment
-            obs, info = env.reset(
+        sim_days = st.slider("Days", 7, 90, EPISODE_LENGTH)
+    with col4:
+        start_dow = st.selectbox("Start day", range(7), format_func=lambda i: DAY_NAMES[i])
+        start_month = st.selectbox("Start month", range(1, 13), format_func=lambda m: MONTH_NAMES[m - 1])
+
+    policy_label = "Random policy"
+    if ppo_model is not None:
+        policy_label = "PPO agent (deterministic)"
+
+        def ppo_policy(obs, env):
+            action, _ = ppo_model.predict(obs, deterministic=True)
+            return int(action)
+        policy = ppo_policy
+    else:
+        st.warning("PPO not loaded — using random actions.")
+
+        def random_policy(obs, env):
+            return env.action_space.sample()
+        policy = random_policy
+
+    predictor = demand_predictor if use_ml_demand else None
+    if not predictor and use_ml_demand:
+        st.warning("Demand model not loaded — using analytical demand.")
+
+    if st.button("▶️ Run episode", type="primary", use_container_width=True):
+        with st.spinner("Simulating..."):
+            env = make_simulation_env(predictor, category, seed=42)
+            history, info = run_episode(
+                env,
+                policy,
+                sim_days,
+                reset_options={
+                    "initial_price_idx": price_to_index(initial_price),
+                    "initial_inventory": initial_inventory,
+                    "day_of_week": start_dow,
+                    "month": start_month,
+                    "product_category": category,
+                },
                 seed=42,
-                options={
-                    "initial_price_idx": price_idx,
-                    "initial_inventory": initial_inventory
-                }
             )
-            
-            # Run episode
-            for step in range(simulation_days):
-                if model is not None:
-                    action, _ = model.predict(obs, deterministic=True)
-                else:
-                    # Random or heuristic policy
-                    action = env.action_space.sample()
-                
-                obs, reward, terminated, truncated, info = env.step(action)
-                
-                if terminated or truncated:
-                    break
-            
-            # Get results
-            history_df = env.get_history_df()
-        
-        # Display results
-        st.success(f"Simulation complete! Total Profit: ${info['total_profit']:.2f}")
-        
-        # Metrics
-        metrics_cols = st.columns(4)
-        metrics_cols[0].metric("Total Revenue", f"${info['total_revenue']:.2f}")
-        metrics_cols[1].metric("Total Profit", f"${info['total_profit']:.2f}")
-        metrics_cols[2].metric("Avg Price", f"${np.mean(history_df['prices']):.2f}")
-        metrics_cols[3].metric("Total Sales", int(sum(history_df['sales'])))
-        
-        # Charts
-        st.subheader("Simulation Results")
-        
+            st.session_state["sim_history"] = history
+            st.session_state["sim_info"] = info
+            st.session_state["sim_policy"] = policy_label
+
+    if "sim_history" in st.session_state:
+        history = st.session_state["sim_history"]
+        info = st.session_state["sim_info"]
+
+        st.success(
+            f"Done — **{st.session_state.get('sim_policy', 'Policy')}** | "
+            f"Profit **${info['total_profit']:.2f}** | Revenue **${info['total_revenue']:.2f}**"
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total profit", f"${info['total_profit']:.2f}")
+        m2.metric("Total revenue", f"${info['total_revenue']:.2f}")
+        m3.metric("Avg price", f"${history['prices'].mean():.2f}")
+        m4.metric("Units sold", int(history["sales"].sum()))
+
         fig = make_subplots(
-            rows=3, cols=1,
-            subplot_titles=("Price Over Time", "Sales & Demand", "Inventory Level"),
-            vertical_spacing=0.1
-        )
-        
-        # Price chart
-        fig.add_trace(
-            go.Scatter(
-                x=history_df['day'], 
-                y=history_df['prices'],
-                mode='lines+markers',
-                name='Price',
-                line=dict(color='blue', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        # Sales vs Demand
-        fig.add_trace(
-            go.Bar(
-                x=history_df['day'],
-                y=history_df['demands'],
-                name='Demand',
-                marker_color='lightblue'
-            ),
-            row=2, col=1
+            rows=3,
+            cols=1,
+            subplot_titles=("Price chosen by agent", "Demand vs sales", "Inventory"),
+            vertical_spacing=0.08,
+            row_heights=[0.35, 0.35, 0.3],
         )
         fig.add_trace(
             go.Scatter(
-                x=history_df['day'],
-                y=history_df['sales'],
-                mode='markers',
-                name='Actual Sales',
-                marker=dict(color='green', size=8)
+                x=history["day"],
+                y=history["prices"],
+                mode="lines+markers",
+                name="Price",
+                line=dict(color="#4f9cf9", width=2),
             ),
-            row=2, col=1
+            row=1,
+            col=1,
         )
-        
-        # Inventory
+        fig.add_trace(
+            go.Bar(x=history["day"], y=history["demands"], name="Demand", marker_color="#94a3b8"),
+            row=2,
+            col=1,
+        )
         fig.add_trace(
             go.Scatter(
-                x=history_df['day'],
-                y=history_df['inventory'],
-                mode='lines',
-                name='Inventory',
-                line=dict(color='orange', width=2),
-                fill='tozeroy'
+                x=history["day"],
+                y=history["sales"],
+                mode="markers",
+                name="Sales",
+                marker=dict(color="#3dd68c", size=9),
             ),
-            row=3, col=1
+            row=2,
+            col=1,
         )
-        
-        fig.update_layout(
-            height=800,
-            showlegend=True,
-            hovermode='x unified'
+        fig.add_trace(
+            go.Scatter(
+                x=history["day"],
+                y=history["inventory"],
+                mode="lines",
+                name="Inventory",
+                fill="tozeroy",
+                line=dict(color="#f59e0b"),
+            ),
+            row=3,
+            col=1,
         )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Data table
-        with st.expander("View Raw Data"):
-            st.dataframe(history_df, use_container_width=True)
-
-
-# =============================================================================
-# STRATEGY COMPARISON
-# =============================================================================
-
-elif page == "📊 Strategy Comparison":
-    st.header("Compare Pricing Strategies")
-    
-    st.write("""
-    Compare different pricing strategies over multiple episodes:
-    - **RL Agent**: Trained PPO policy
-    - **Fixed Price**: Constant price (baseline)
-    - **Random**: Random price selection
-    - **Low-High**: Alternates between low and high prices
-    """)
-    
-    n_episodes = st.slider("Number of Episodes", 5, 50, 10)
-    
-    if st.button("▶️ Run Comparison", type="primary"):
-        with st.spinner(f"Running {n_episodes} episodes per strategy..."):
-            
-            strategies = {
-                'Random': lambda obs, env: env.action_space.sample(),
-                'Fixed (Mid)': lambda obs, env: N_PRICE_ACTIONS // 2,
-                'Fixed (Low)': lambda obs, env: 0,
-                'Fixed (High)': lambda obs, env: N_PRICE_ACTIONS - 1,
-            }
-            
-            if model is not None:
-                strategies['RL Agent'] = lambda obs, env: model.predict(obs, deterministic=True)[0]
-            
-            results = {name: {'profits': [], 'revenues': []} for name in strategies.keys()}
-            
-            for name, policy in strategies.items():
-                for ep in range(n_episodes):
-                    env = PricingEnv(seed=ep)
-                    obs, info = env.reset(seed=ep)
-                    
-                    done = False
-                    while not done:
-                        action = policy(obs, env)
-                        obs, reward, terminated, truncated, info = env.step(action)
-                        done = terminated or truncated
-                    
-                    results[name]['profits'].append(info['total_profit'])
-                    results[name]['revenues'].append(info['total_revenue'])
-        
-        # Results summary
-        st.subheader("Results Summary")
-        
-        summary_data = []
-        for name, data in results.items():
-            summary_data.append({
-                'Strategy': name,
-                'Avg Profit': f"${np.mean(data['profits']):.2f}",
-                'Profit Std': f"${np.std(data['profits']):.2f}",
-                'Avg Revenue': f"${np.mean(data['revenues']):.2f}",
-                'Revenue Std': f"${np.std(data['revenues']):.2f}"
-            })
-        
-        summary_df = pd.DataFrame(summary_data)
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-        
-        # Box plot comparison
-        fig = go.Figure()
-        
-        for name, data in results.items():
-            fig.add_trace(go.Box(
-                y=data['profits'],
-                name=name,
-                boxpoints='all',
-                jitter=0.3,
-                pointpos=-1.8
-            ))
-        
-        fig.update_layout(
-            title="Profit Distribution by Strategy",
-            yaxis_title="Profit ($)",
-            showlegend=False
-        )
-        
+        fig.update_layout(height=720, template="plotly_dark", hovermode="x unified")
+        fig.update_yaxes(title_text="USD", row=1, col=1)
+        fig.update_yaxes(title_text="Units", row=2, col=1)
+        fig.update_yaxes(title_text="Units", row=3, col=1)
         st.plotly_chart(fig, use_container_width=True)
 
+        with st.expander("Episode data"):
+            st.dataframe(history, use_container_width=True)
 
-# =============================================================================
-# TRAINING ANALYSIS
-# =============================================================================
 
-elif page == "📈 Training Analysis":
-    st.header("Training Analysis")
-    
-    st.info("Upload training logs or tensorboard data to visualize training progress")
-    
-    # Placeholder for training visualization
-    st.write("""
-    This section will display:
-    - Learning curves (reward over time)
-    - Policy loss evolution
-    - Value function accuracy
-    - Episode length statistics
-    
-    To use: Train the model with `python -m training.train_ppo`, 
-    then point to the logs directory.
-    """)
-    
-    # Mock training curve for demonstration
-    st.subheader("Example Training Curve")
-    
-    # Generate mock data
-    steps = np.linspace(0, 100000, 100)
-    rewards = 50 * (1 - np.exp(-steps / 30000)) + np.random.normal(0, 5, 100)
-    
-    fig = px.line(
-        x=steps,
-        y=rewards,
-        title="Mean Episode Reward (Example)",
-        labels={'x': 'Timesteps', 'y': 'Mean Reward'}
+# ---------------------------------------------------------------------------
+# What-if explorer
+# ---------------------------------------------------------------------------
+
+elif page == "🔮 What-if explorer":
+    st.title("🔮 Demand what-if explorer")
+    st.caption("Probe the LightGBM demand model — change price and calendar context interactively.")
+
+    if demand_predictor is None:
+        st.error("Load the demand model first (`python -m training.train_demand_predictor`).")
+        st.stop()
+
+    left, right = st.columns([1, 1.4])
+
+    with left:
+        st.subheader("Scenario")
+        whatif_price = st.slider(
+            "Price ($)",
+            float(MIN_PRICE),
+            float(MAX_PRICE),
+            400.0,
+            float(PRICE_STEP),
+        )
+        whatif_dow = st.selectbox("Day of week", range(7), format_func=lambda i: DAY_NAMES[i], key="whatif_dow")
+        whatif_month = st.selectbox(
+            "Month", range(1, 13), format_func=lambda m: MONTH_NAMES[m - 1], key="whatif_month"
+        )
+        whatif_cat = st.selectbox("Category", PRODUCT_CATEGORIES, index=PRODUCT_CATEGORIES.index(category))
+
+        pred = demand_predictor.predict_demand(
+            whatif_price, whatif_dow, whatif_month, whatif_cat
+        )
+        est_profit = (whatif_price - UNIT_COST) * max(0.0, pred)
+
+        st.markdown("---")
+        st.metric("Predicted demand (units)", f"{max(0, pred):.2f}")
+        st.metric("Est. gross margin / day", f"${est_profit:.2f}")
+        st.caption(f"Margin ≈ (price − ${UNIT_COST:.0f}) × demand")
+
+    with right:
+        st.subheader("Demand vs price curve")
+        n_points = st.slider("Curve resolution", 15, 50, 25)
+        prices = np.linspace(MIN_PRICE, MAX_PRICE, n_points)
+        curve_df = build_demand_curve(
+            demand_predictor, whatif_cat, whatif_dow, whatif_month, prices
+        )
+
+        fig = px.line(
+            curve_df,
+            x="price",
+            y="predicted_demand",
+            markers=True,
+            title=f"Demand curve — {whatif_cat}, {DAY_NAMES[whatif_dow]}, {MONTH_NAMES[whatif_month - 1]}",
+            labels={"price": "Price ($)", "predicted_demand": "Predicted demand"},
+        )
+        fig.add_vline(
+            x=whatif_price,
+            line_dash="dash",
+            line_color="#f59e0b",
+            annotation_text=f"Your price ${whatif_price:.0f}",
+        )
+        fig.update_layout(template="plotly_dark", height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Compare categories at this price")
+    compare_rows = []
+    for cat in PRODUCT_CATEGORIES:
+        d = demand_predictor.predict_demand(whatif_price, whatif_dow, whatif_month, cat)
+        compare_rows.append({
+            "category": cat,
+            "predicted_demand": round(max(0, d), 2),
+            "est_margin": round((whatif_price - UNIT_COST) * max(0, d), 2),
+        })
+    compare_df = pd.DataFrame(compare_rows)
+    fig_bar = px.bar(
+        compare_df,
+        x="category",
+        y="predicted_demand",
+        color="category",
+        title=f"Demand by category @ ${whatif_price:.0f}",
+        text="predicted_demand",
     )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # File upload for actual logs
-    uploaded_file = st.file_uploader("Upload training log CSV", type=['csv'])
-    
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        st.write("Uploaded data preview:")
-        st.dataframe(df.head())
+    fig_bar.update_layout(template="plotly_dark", showlegend=False, height=320)
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Strategy comparison
+# ---------------------------------------------------------------------------
+
+elif page == "📊 Strategy comparison":
+    st.title("📊 Strategy comparison")
+    st.caption("Same market (LightGBM demand) — compare PPO vs fixed-price baselines.")
+
+    n_episodes = st.slider("Episodes per strategy", 3, 30, 10)
+    compare_category = st.selectbox(
+        "Category",
+        PRODUCT_CATEGORIES,
+        index=PRODUCT_CATEGORIES.index(category),
+        key="compare_cat",
+    )
+
+    predictor = demand_predictor if use_ml_demand else None
+
+    strategies: dict[str, Callable] = {
+        "Random": lambda obs, env: env.action_space.sample(),
+        "Low price": lambda obs, env: 0,
+        "Mid price": lambda obs, env: N_PRICE_ACTIONS // 2,
+        "High price": lambda obs, env: N_PRICE_ACTIONS - 1,
+    }
+    if ppo_model is not None:
+        strategies["PPO agent"] = lambda obs, env: int(
+            ppo_model.predict(obs, deterministic=True)[0]
+        )
+
+    if st.button("▶️ Run comparison", type="primary", use_container_width=True):
+        results = {name: {"profits": [], "revenues": []} for name in strategies}
+        progress = st.progress(0.0)
+        total = len(strategies) * n_episodes
+        done = 0
+
+        for name, policy in strategies.items():
+            for ep in range(n_episodes):
+                env = make_simulation_env(predictor, compare_category, seed=ep)
+                _, info = run_episode(
+                    env,
+                    policy,
+                    EPISODE_LENGTH,
+                    reset_options={"product_category": compare_category},
+                    seed=ep,
+                )
+                results[name]["profits"].append(info["total_profit"])
+                results[name]["revenues"].append(info["total_revenue"])
+                done += 1
+                progress.progress(done / total)
+
+        st.session_state["compare_results"] = results
+        progress.empty()
+
+    if "compare_results" in st.session_state:
+        results = st.session_state["compare_results"]
+        summary = []
+        for name, data in results.items():
+            summary.append({
+                "Strategy": name,
+                "Avg profit": np.mean(data["profits"]),
+                "Std profit": np.std(data["profits"]),
+                "Avg revenue": np.mean(data["revenues"]),
+            })
+        summary_df = pd.DataFrame(summary).sort_values("Avg profit", ascending=False)
+        summary_df["Avg profit"] = summary_df["Avg profit"].map(lambda x: f"${x:,.2f}")
+        summary_df["Std profit"] = summary_df["Std profit"].map(lambda x: f"${x:,.2f}")
+        summary_df["Avg revenue"] = summary_df["Avg revenue"].map(lambda x: f"${x:,.2f}")
+
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        fig = go.Figure()
+        for name, data in results.items():
+            fig.add_trace(
+                go.Box(y=data["profits"], name=name, boxpoints="all", jitter=0.3, pointpos=-1.8)
+            )
+        fig.update_layout(
+            title="Profit distribution",
+            yaxis_title="Profit ($)",
+            template="plotly_dark",
+            height=450,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Training metrics
+# ---------------------------------------------------------------------------
+
+elif page == "📈 Training metrics":
+    st.title("📈 PPO training metrics")
+
+    log_files = find_training_logs()
+    if not log_files:
+        st.warning("No evaluation logs found. Train with: `python -m training.train_ppo`")
+    else:
+        selected_log = st.selectbox(
+            "Training run",
+            log_files,
+            format_func=lambda p: p.parent.name,
+        )
+        data = np.load(selected_log)
+        timesteps = data["timesteps"]
+        results = data["results"]  # (n_evals, n_episodes)
+        mean_rewards = results.mean(axis=1)
+        std_rewards = results.std(axis=1)
+
+        c1, c2 = st.columns(2)
+        c1.metric("Eval checkpoints", len(timesteps))
+        c2.metric("Best mean reward", f"{mean_rewards.max():.2f}")
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=timesteps,
+                y=mean_rewards,
+                mode="lines+markers",
+                name="Mean eval reward",
+                line=dict(color="#4f9cf9", width=2),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=np.concatenate([timesteps, timesteps[::-1]]),
+                y=np.concatenate([mean_rewards + std_rewards, (mean_rewards - std_rewards)[::-1]]),
+                fill="toself",
+                fillcolor="rgba(79, 156, 249, 0.15)",
+                line=dict(color="rgba(255,255,255,0)"),
+                name="±1 std",
+                showlegend=True,
+            )
+        )
+        fig.update_layout(
+            title="Evaluation reward during PPO training",
+            xaxis_title="Timesteps",
+            yaxis_title="Mean episode reward (scaled)",
+            template="plotly_dark",
+            height=420,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    if demand_meta:
+        st.subheader("Demand model (LightGBM)")
+        m1, m2, m3 = st.columns(3)
+        metrics = demand_meta.get("metrics", {})
+        m1.metric("Test RMSE", f"{metrics.get('rmse', 0):.3f}")
+        m2.metric("Test MAE", f"{metrics.get('mae', 0):.3f}")
+        m3.metric("Test R²", f"{metrics.get('r2', 0):.4f}")
+
+        with st.expander("Feature list & hyperparameters"):
+            st.json(demand_meta)
 
 
 # Footer
 st.markdown("---")
-st.caption("RL Dynamic Pricing MVP | Built with Streamlit, Gymnasium, and Stable-Baselines3")
+st.caption(
+    "RL Dynamic Pricing | Streamlit + LightGBM + PPO (Stable-Baselines3) | "
+    f"Category: **{category}**"
+)

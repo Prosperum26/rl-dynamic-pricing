@@ -1,111 +1,135 @@
 # rl-dynamic-pricing
 
-An AI-powered dynamic pricing system using Reinforcement Learning and demand forecasting to optimize product pricing strategies in e-commerce environments.
+AI-powered **dynamic pricing** for e-commerce: forecast demand with **LightGBM**, learn a pricing policy with **PPO** (Stable-Baselines3), and explore results in a **Streamlit** dashboard.
 
-## Overview
+## Features
 
-This MVP implements a complete RL-based dynamic pricing pipeline:
+- **Demand forecasting** — global LightGBM model with product category as a feature
+- **RL simulation** — Gymnasium `PricingEnv` driven by the trained demand model
+- **PPO agent** — discrete price actions over a calibrated price grid
+- **Interactive dashboard** — live episodes, what-if demand curves, strategy comparison, training charts
 
-- **Demand Prediction**: LightGBM model forecasts sales at different price points
-- **RL Environment**: Gymnasium environment simulates pricing decisions
-- **PPO Agent**: Stable-Baselines3 trains the pricing policy
-- **Dashboard**: Streamlit interface for monitoring and testing
-
-## Project Structure
+## Project structure
 
 ```
 rl-dynamic-pricing/
-├── config/              # Configuration constants
-├── data/               # Raw and processed datasets
-├── environment/        # Gymnasium RL environment
-├── models/             # Saved models (LightGBM, PPO)
-├── notebooks/          # Jupyter notebooks for exploration
-├── training/           # Training scripts
-├── dashboard/          # Streamlit dashboard
-├── logs/               # Training logs
-├── requirements.txt    # Python dependencies
-└── README.md           # This file
+├── config/                 # Hyperparameters & paths (constants.py)
+├── data/                   # Datasets only (CSVs not in git)
+│   ├── raw/                # Transaction-level exports
+│   ├── processed/          # Aggregated training tables
+│   ├── synthetic/          # Optional generated data
+│   └── README.md
+├── scripts/                # Preprocessing & CLI utilities
+│   ├── preprocess_ecommerce.py
+│   ├── generate_data.py
+│   └── quickstart.py
+├── environment/            # Gymnasium PricingEnv
+├── training/               # Model training
+├── dashboard/              # Streamlit web UI
+├── notebooks/
+├── models/                 # Saved models (local)
+├── logs/                   # PPO training logs (local)
+└── requirements.txt
 ```
 
-## Quick Start
+## Quick start
 
-### 1. Setup Environment
+### 1. Setup
 
 ```bash
-# Create virtual environment
 python -m venv .venv
-
-# Activate (Windows)
-.venv\Scripts\activate
-
-# Install dependencies
+.venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 ```
 
-### 2. Generate Synthetic Data
+### 2. Data
+
+Place raw CSV here:
+
+`data/raw/ecommerce_dynamic_pricing_dataset.csv`
+
+Preprocess:
 
 ```bash
-python -c "from data.generate_data import generate_dataset; generate_dataset('data/synthetic_sales.csv', n_samples=5000)"
+python -m scripts.preprocess_ecommerce
 ```
 
-### 3. Train Demand Predictor
+Output: `data/processed/processed_sales.csv`
+
+### 3. Train demand model
 
 ```bash
 python -m training.train_demand_predictor
 ```
 
-### 4. Train PPO Agent
+### 4. Train PPO agent
 
 ```bash
-python -m training.train_ppo
+python -m training.train_ppo --timesteps 50000 --category Books
 ```
 
-### 5. Launch Dashboard
+### 5. Dashboard
 
 ```bash
 streamlit run dashboard/streamlit_app.py
 ```
 
-## Architecture
+### Smoke test
 
-### Components
+```bash
+python scripts/quickstart.py
+```
 
-1. **PricingEnv** (`environment/pricing_env.py`)
-   - Gymnasium environment for pricing decisions
-   - State: current price, inventory, time features
-   - Action: price adjustment (discrete or continuous)
-   - Reward: revenue maximization with penalty for stockouts
+## Pipeline
 
-2. **PPO Training** (`training/train_ppo.py`)
-   - Uses Stable-Baselines3 PPO implementation
-   - Configurable hyperparameters
-   - Automatic model checkpointing
-
-3. **Demand Predictor** (`training/train_demand_predictor.py`)
-   - LightGBM regression model
-   - Features: price, day_of_week, month, holiday_flag
-   - Predicts expected sales volume
-
-4. **Dashboard** (`dashboard/streamlit_app.py`)
-   - Interactive price testing
-   - Training visualization
-   - Live simulation
+```
+data/raw/*.csv
+      |
+      v
+scripts/preprocess_ecommerce.py  -->  data/processed/processed_sales.csv
+      |
+      v
+training/train_demand_predictor.py  -->  models/demand_*.joblib
+      |
+      v
+training/train_ppo.py  -->  models/best_model/best_model.zip
+      |
+      v
+dashboard/streamlit_app.py
+```
 
 ## Configuration
 
-Edit `config/constants.py` to customize:
+Edit [`config/constants.py`](config/constants.py) for price grid, inventory, categories, and training hyperparameters. Paths:
 
-- Price bounds and granularity
-- Inventory constraints
-- Training hyperparameters
-- Feature engineering settings
+| Constant | Default path |
+|----------|----------------|
+| `RAW_SALES_PATH` | `data/raw/ecommerce_dynamic_pricing_dataset.csv` |
+| `PROCESSED_SALES_PATH` | `data/processed/processed_sales.csv` |
+| `SYNTHETIC_SALES_PATH` | `data/synthetic/synthetic_sales.csv` |
 
-## Hardware Requirements
+## CLI reference
 
-- **Minimum**: Any modern laptop with 8GB RAM
-- **Recommended**: 16GB RAM for larger datasets
-- **GPU**: Optional (CPU training works fine for this scale)
+| Command | Purpose |
+|---------|---------|
+| `python -m scripts.preprocess_ecommerce` | Raw CSV → processed |
+| `python -m scripts.generate_data` | Synthetic data → `data/synthetic/` |
+| `python -m training.train_demand_predictor` | Train LightGBM |
+| `python -m training.train_ppo --timesteps N` | Train PPO |
+| `python -m training.train_ppo --evaluate models/best_model/best_model.zip` | Evaluate |
+| `streamlit run dashboard/streamlit_app.py` | Web UI |
+
+## Git vs local files
+
+| In repository | Local only |
+|---------------|------------|
+| Source code, `data/README.md`, `.gitkeep` | `data/**/*.csv`, `models/*`, `logs/*`, `.venv/` |
+
+## Requirements
+
+- Python 3.10+
+- ~8 GB RAM (CPU is fine for this MVP)
 
 ## License
 
-MIT License - See LICENSE file
+MIT — see [LICENSE](LICENSE).
