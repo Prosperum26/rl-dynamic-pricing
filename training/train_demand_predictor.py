@@ -1,14 +1,11 @@
 """
 Demand Predictor Training Script.
 
-Trains a global LightGBM model on processed_sales.csv with category as a feature.
+Trains a global LightGBM model on processed_sales.csv with enriched features.
 
 Usage:
+    python -m scripts.preprocess_ecommerce
     python -m training.train_demand_predictor
-
-    python -m training.train_demand_predictor --data data/processed_sales.csv
-
-    python -m training.train_demand_predictor --random-split
 """
 
 import argparse
@@ -19,13 +16,11 @@ from pathlib import Path
 import joblib
 import lightgbm as lgb
 import numpy as np
-import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from config.constants import (
+    DEMAND_TARGET_COL,
     LGB_PARAMS,
     MODELS_DIR,
     PROCESSED_SALES_PATH,
@@ -43,10 +38,12 @@ from training.demand_features import (
     save_metadata,
     time_based_split,
 )
+from training.demand_metrics import compute_demand_metrics, format_metrics
 
 
-def generate_synthetic_data(n_samples: int = 5000, seed: int = RANDOM_SEED) -> pd.DataFrame:
-    """Generate synthetic sales data (includes category for global model)."""
+def generate_synthetic_data(n_samples: int = 5000, seed: int = RANDOM_SEED):
+    """Generate synthetic data compatible with the enriched feature pipeline."""
+    import pandas as pd
     from config.constants import PRODUCT_CATEGORIES
 
     np.random.seed(seed)
@@ -56,21 +53,25 @@ def generate_synthetic_data(n_samples: int = 5000, seed: int = RANDOM_SEED) -> p
     month = dates.month
     categories = np.random.choice(PRODUCT_CATEGORIES, n_samples)
 
-    base_demand = 2.0
-    price_effect = -0.002 * prices
-    weekend_boost = np.where(day_of_week >= 5, 0.5, 0)
-    holiday_boost = np.where((month == 11) | (month == 12), 0.8, 0)
-    noise = np.random.normal(0, 0.5, n_samples)
-    demand = np.maximum(base_demand + price_effect + weekend_boost + holiday_boost + noise, 0)
+    demand = np.maximum(
+        2.0 - 0.002 * prices
+        + np.where(day_of_week >= 5, 0.5, 0)
+        + np.where((month == 11) | (month == 12), 0.8, 0)
+        + np.random.normal(0, 0.5, n_samples),
+        0,
+    )
 
     return pd.DataFrame({
         "date": dates,
         "category": categories,
         "price": np.round(prices, 2),
+        "avg_price": np.round(prices, 2),
         "day_of_week": day_of_week,
         "month": month,
         "is_weekend": (day_of_week >= 5).astype(int),
         "is_holiday_season": ((month == 11) | (month == 12)).astype(int),
+        "avg_discount_rate": np.random.uniform(0.02, 0.15, n_samples),
+        "transaction_count": np.random.poisson(3, n_samples) + 1,
         "demand": demand,
     })
 
@@ -81,72 +82,54 @@ def train_model(
     generate_data: bool = True,
     time_split: bool = True,
 ):
-    """
-    Train global LightGBM demand model with category one-hot features.
-
-    Args:
-        data_path: Path to processed or compatible CSV
-        save_model: Persist model, encoder, and metadata
-        generate_data: Generate synthetic data if no file is available
-        time_split: Use chronological train/test split (recommended for real data)
-    """
     print("=" * 60)
-    print("Training Global Demand Prediction Model")
+    print("Training Global Demand Prediction Model (v2 features)")
     print("=" * 60)
 
-    # Load data
     if data_path and os.path.exists(data_path):
         print(f"Loading data from: {data_path}")
         df = load_processed_sales(Path(data_path))
         split_type = "time" if time_split else "random"
     elif DEFAULT_PROCESSED_PATH.exists():
-        print(f"Loading default processed data: {DEFAULT_PROCESSED_PATH}")
+        print(f"Loading: {DEFAULT_PROCESSED_PATH}")
         df = load_processed_sales(DEFAULT_PROCESSED_PATH)
         split_type = "time" if time_split else "random"
     elif generate_data:
         print("Generating synthetic training data...")
         df = generate_synthetic_data(n_samples=5000)
+        SYNTHETIC_SALES_PATH.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(SYNTHETIC_SALES_PATH, index=False)
-        print(f"Synthetic data saved to: {SYNTHETIC_SALES_PATH}")
         split_type = "random"
     else:
-        raise ValueError(
-            "No data found. Run: python -m scripts.preprocess_ecommerce"
-        )
+        raise ValueError("No data found. Run: python -m scripts.preprocess_ecommerce")
 
-    print(f"Dataset shape: {df.shape}")
-    print(f"Date range: {df['date'].min().date()} to {df['date'].max().date()}")
-    print(f"Categories: {sorted(df['category'].unique())}")
-    print(f"Demand - mean: {df['demand'].mean():.2f}, max: {df['demand'].max():.2f}")
-    print(f"Price - mean: ${df['price'].mean():.2f}, max: ${df['price'].max():.2f}")
-
-    # Encode features (price + calendar + category one-hot)
-    encoder = DemandFeatureEncoder()
-    encoder.fit(df)
+    target_col = DEMAND_TARGET_COL
+    print(f"Dataset: {df.shape[0]} rows, target={target_col}")
+    print(f"  demand mean={df[target_col].mean():.2f}, zeros={(df[target_col]==0).mean():.1%}")
+    print(f"  price mean=${df['price'].mean():.2f}")
 
     if time_split:
         train_df, test_df = time_based_split(df, test_size=TRAIN_TEST_SPLIT)
-        X_train = encoder.transform(train_df)
-        y_train = train_df["demand"].values
-        X_test = encoder.transform(test_df)
-        y_test = test_df["demand"].values
-        print(f"\nTime-based split - train: {len(train_df)}, test: {len(test_df)}")
-        print(f"  Train dates: {train_df['date'].min().date()} to {train_df['date'].max().date()}")
-        print(f"  Test dates:  {test_df['date'].min().date()} to {test_df['date'].max().date()}")
+        print(f"\nTime split: train={len(train_df)}, test={len(test_df)}")
     else:
-        X = encoder.transform(df)
-        y = df["demand"].values
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=TRAIN_TEST_SPLIT, random_state=RANDOM_SEED
+        from sklearn.model_selection import train_test_split
+        train_df, test_df = train_test_split(
+            df, test_size=TRAIN_TEST_SPLIT, random_state=RANDOM_SEED
         )
         split_type = "random"
-        print(f"\nRandom split — train: {len(X_train)}, test: {len(X_test)}")
+        print(f"\nRandom split: train={len(train_df)}, test={len(test_df)}")
 
-    feature_names = encoder.feature_names_
-    print(f"Features ({len(feature_names)}): {feature_names}")
+    # Fit encoder on train only (no leakage for category stats)
+    encoder = DemandFeatureEncoder()
+    encoder.fit(train_df)
+    X_train = encoder.transform(train_df)
+    y_train = train_df[target_col].values
+    X_test = encoder.transform(test_df)
+    y_test = test_df[target_col].values
 
-    # Train LightGBM
-    print("\nTraining LightGBM model...")
+    print(f"Features ({len(encoder.feature_names_)}): {encoder.feature_names_}")
+
+    print("\nTraining LightGBM...")
     model = lgb.LGBMRegressor(**LGB_PARAMS, random_state=RANDOM_SEED)
     model.fit(
         X_train,
@@ -155,91 +138,61 @@ def train_model(
         eval_metric="rmse",
         callbacks=[
             lgb.early_stopping(stopping_rounds=50),
-            lgb.log_evaluation(period=0),
+            lgb.log_evaluation(period=50),
         ],
     )
 
-    y_pred = model.predict(X_test)
-    rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-    mae = float(mean_absolute_error(y_test, y_pred))
-    r2 = float(r2_score(y_test, y_pred))
+    y_pred = np.clip(model.predict(X_test), 0, None)
+    metrics = compute_demand_metrics(y_test, y_pred)
 
-    print(f"\nTest Set Performance ({split_type} split):")
-    print(f"  RMSE: {rmse:.3f}")
-    print(f"  MAE:  {mae:.3f}")
-    print(f"  R²:   {r2:.4f}")
+    print(f"\nTest metrics ({split_type} split):")
+    print(format_metrics(metrics))
 
-    print("\nFeature Importance:")
+    print("\nFeature importance (top 10):")
     for name, imp in sorted(
-        zip(feature_names, model.feature_importances_),
+        zip(encoder.feature_names_, model.feature_importances_),
         key=lambda x: -x[1],
-    ):
+    )[:10]:
         print(f"  {name}: {imp:.0f}")
 
     if save_model:
         MODELS_DIR.mkdir(exist_ok=True)
         joblib.dump(model, MODEL_PATH)
         encoder.save(ENCODER_PATH)
-        print(f"\nModel saved to: {MODEL_PATH}")
-        print(f"Encoder saved to: {ENCODER_PATH}")
 
         metadata = {
             "model_type": "LightGBM",
+            "model_version": 2,
+            "target": target_col,
+            "target_description": "daily conversion count per category",
             "global_model": True,
             "split_type": split_type,
-            "features": feature_names,
+            "features": encoder.feature_names_,
             "categories": encoder.categories,
-            "metrics": {"rmse": rmse, "mae": mae, "r2": r2},
+            "category_stats": encoder.category_stats_,
+            "metrics": metrics,
             "hyperparameters": LGB_PARAMS,
             "n_train": len(y_train),
             "n_test": len(y_test),
         }
         save_metadata(metadata)
-        print(f"Metadata saved to: {METADATA_PATH}")
+        print(f"\nSaved model  -> {MODEL_PATH}")
+        print(f"Saved encoder -> {ENCODER_PATH}")
+        print(f"Saved metadata -> {METADATA_PATH}")
 
     print("=" * 60)
-    print("Training complete!")
-    return model, encoder, {"rmse": rmse, "mae": mae, "r2": r2}
-
-
-def predict_demand(
-    price: float,
-    day_of_week: int,
-    month: int,
-    category: str,
-    model_path: Path | None = None,
-    encoder_path: Path | None = None,
-) -> float:
-    """Predict demand for a single (price, time, category) tuple."""
-    from training.demand_features import DemandPredictorWrapper
-
-    wrapper = DemandPredictorWrapper.load(
-        model_path or MODEL_PATH,
-        encoder_path or ENCODER_PATH,
-    )
-    return wrapper.predict_demand(price, day_of_week, month, category)
+    goal_met = metrics["r2"] >= 0.3
+    print(f"R2 goal (>= 0.3): {'PASS' if goal_met else 'BELOW TARGET - consider more data or features'}")
+    print("=" * 60)
+    return model, encoder, metrics
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train global demand prediction model")
-    parser.add_argument(
-        "--data",
-        type=str,
-        default=str(PROCESSED_SALES_PATH),
-        help="Path to processed_sales.csv",
-    )
-    parser.add_argument("--no-save", action="store_true", help="Do not save model")
-    parser.add_argument(
-        "--no-generate",
-        action="store_true",
-        help="Fail instead of generating synthetic data",
-    )
-    parser.add_argument(
-        "--random-split",
-        action="store_true",
-        help="Use random train/test split instead of time-based",
-    )
-
+    parser = argparse.ArgumentParser(description="Train demand prediction model")
+    parser.add_argument("--data", type=str, default=str(PROCESSED_SALES_PATH))
+    parser.add_argument("--no-save", action="store_true")
+    parser.add_argument("--no-generate", action="store_true")
+    parser.add_argument("--random-split", action="store_true")
     args = parser.parse_args()
 
     data_path = args.data if args.data and os.path.exists(args.data) else None

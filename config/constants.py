@@ -172,19 +172,25 @@ EVAL_EPISODES = 10
 # LIGHTGBM CONFIGURATION
 # =============================================================================
 
-# Model hyperparameters
+# Model hyperparameters (tuned for sparse daily conversion counts)
 LGB_PARAMS = {
     "objective": "regression",
     "metric": "rmse",
     "boosting_type": "gbdt",
+    "n_estimators": 500,
+    "learning_rate": 0.03,
     "num_leaves": 31,
-    "learning_rate": 0.05,
+    "min_child_samples": 10,
     "feature_fraction": 0.9,
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
+    "reg_alpha": 0.1,
+    "reg_lambda": 0.1,
     "verbose": -1,
-    "n_estimators": 100,
 }
+
+# Target column name in processed_sales.csv
+DEMAND_TARGET_COL = "demand"
 
 # Train/test split
 TRAIN_TEST_SPLIT = 0.2

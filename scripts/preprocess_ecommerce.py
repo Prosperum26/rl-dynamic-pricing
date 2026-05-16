@@ -33,13 +33,16 @@ REQUIRED_RAW_COLUMNS = [
 PROCESSED_COLUMNS = [
     "date",
     "category",
-    "demand",
+    "demand",              # daily conversion count (sum of 0/1 purchase_probability)
     "avg_price",
+    "log_avg_price",
     "transaction_count",
     "avg_discount",
+    "avg_discount_rate",
     "day_of_week",
     "month",
     "is_weekend",
+    "is_holiday_season",
 ]
 
 PURCHASE_PROB_COL = "Purchase Probability"
@@ -115,6 +118,11 @@ def compute_effective_price(df: pd.DataFrame, apply_discount: bool = True) -> pd
 
 
 def aggregate_by_date_category(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate to daily category level.
+
+    demand = number of predicted conversions (purchase_probability is 0/1 in source data).
+    """
     grouped = df.groupby(["date", "Product_Category"], as_index=False).agg(
         demand=("purchase_probability", "sum"),
         avg_price=("effective_price", "mean"),
@@ -125,6 +133,11 @@ def aggregate_by_date_category(df: pd.DataFrame) -> pd.DataFrame:
         is_weekend=("is_weekend", "first"),
     )
     grouped = grouped.rename(columns={"Product_Category": "category"})
+    grouped["log_avg_price"] = np.log1p(grouped["avg_price"])
+    grouped["avg_discount_rate"] = (
+        grouped["avg_discount"] / grouped["avg_price"].replace(0, np.nan)
+    ).fillna(0).clip(0, 1)
+    grouped["is_holiday_season"] = grouped["month"].isin([11, 12]).astype(int)
     return grouped.sort_values(["date", "category"]).reset_index(drop=True)
 
 

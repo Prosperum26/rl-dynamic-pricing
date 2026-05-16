@@ -230,7 +230,11 @@ if page == "🏠 Overview":
     c1.metric("Price actions", N_PRICE_ACTIONS)
     c2.metric("Categories", len(PRODUCT_CATEGORIES))
     c3.metric("Episode length", f"{EPISODE_LENGTH} d")
-    c4.metric("Demand model R²", f"{demand_meta.get('metrics', {}).get('r2', 0):.3f}" if demand_meta else "—")
+    if demand_meta:
+        m = demand_meta.get("metrics", {})
+        c4.metric("Demand R² / MAPE", f"{m.get('r2', 0):.2f} / {m.get('mape', 0):.0%}")
+    else:
+        c4.metric("Demand model", "—")
 
     st.markdown("---")
     left, right = st.columns(2)
@@ -631,11 +635,12 @@ elif page == "📈 Training metrics":
 
     if demand_meta:
         st.subheader("Demand model (LightGBM)")
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         metrics = demand_meta.get("metrics", {})
-        m1.metric("Test RMSE", f"{metrics.get('rmse', 0):.3f}")
-        m2.metric("Test MAE", f"{metrics.get('mae', 0):.3f}")
-        m3.metric("Test R²", f"{metrics.get('r2', 0):.4f}")
+        m1.metric("Test R²", f"{metrics.get('r2', 0):.4f}")
+        m2.metric("R² (demand > 0)", f"{metrics.get('r2_demand_positive', 0):.4f}")
+        m3.metric("MAPE", f"{metrics.get('mape', 0):.1%}" if metrics.get("mape") is not None else "—")
+        m4.metric("RMSE / MAE", f"{metrics.get('rmse', 0):.2f} / {metrics.get('mae', 0):.2f}")
 
         with st.expander("Feature list & hyperparameters"):
             st.json(demand_meta)

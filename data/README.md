@@ -37,4 +37,4 @@ data/
 
 ## Processed schema
 
-`date`, `category`, `demand`, `avg_price`, `transaction_count`, `avg_discount`, `day_of_week`, `month`, `is_weekend`
+`date`, `category`, `demand` (daily conversions), `avg_price`, `log_avg_price`, `transaction_count`, `avg_discount`, `avg_discount_rate`, `day_of_week`, `month`, `is_weekend`, `is_holiday_season`
