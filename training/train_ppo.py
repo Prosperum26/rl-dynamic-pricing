@@ -2,12 +2,13 @@
 PPO Training Script for Dynamic Pricing Agent.
 
 Trains PPO with the trained LightGBM demand model in PricingEnv by default.
+Saves per-category checkpoints to models/best_model/best_model_<slug>.zip.
 
 Usage:
-    python -m training.train_ppo
-    python -m training.train_ppo --timesteps 50000
-    python -m training.train_ppo --no-demand-model
-    python -m training.train_ppo --evaluate models/best_model/best_model.zip
+    python -m training.train_ppo --timesteps 100000 --category Books
+    python -m training.train_ppo --category all
+    python -m training.train_ppo --train-all-categories --timesteps 100000
+    python -m training.train_ppo --evaluate models/best_model/best_model_books.zip
 """
 
 import argparse
@@ -40,12 +41,20 @@ from config.constants import (
     N_EPOCHS,
     N_PRICE_ACTIONS,
     N_STEPS,
+    PRODUCT_CATEGORIES,
     RANDOM_SEED,
     TOTAL_TIMESTEPS,
     VF_COEF,
 )
+from environment.category_wrapper import RandomCategoryResetWrapper
 from environment.pricing_env import PricingEnv
 from training.demand_features import MODEL_PATH, DemandPredictorWrapper
+from training.ppo_paths import (
+    MULTI_CATEGORY_KEY,
+    archive_best_model,
+    normalize_category_arg,
+    ppo_model_path,
+)
 
 
 def load_demand_predictor():
@@ -62,18 +71,32 @@ def make_env(
     seed: int | None = None,
     demand_predictor=None,
     product_category: str = DEFAULT_PRODUCT_CATEGORY,
+    random_category: bool = False,
 ):
-    """Factory for Monitor-wrapped PricingEnv."""
+    """Factory for Monitor-wrapped PricingEnv (optionally random category each episode)."""
 
     def _init():
+        init_category = (
+            DEFAULT_PRODUCT_CATEGORY if random_category else product_category
+        )
         env = PricingEnv(
             demand_predictor=demand_predictor,
-            product_category=product_category,
+            product_category=init_category,
             seed=seed,
         )
+        if random_category:
+            env = RandomCategoryResetWrapper(
+                env, categories=PRODUCT_CATEGORIES, seed=seed
+            )
         return Monitor(env)
 
     return _init
+
+
+def _training_category_label(product_category: str, random_category: bool) -> str:
+    if random_category:
+        return MULTI_CATEGORY_KEY
+    return product_category
 
 
 def run_episode(env: PricingEnv, policy, seed: int) -> dict:
@@ -139,27 +162,38 @@ def train_ppo(
     use_demand_model: bool = True,
     product_category: str = DEFAULT_PRODUCT_CATEGORY,
     compare_before_train: bool = True,
+    random_category: bool = False,
 ):
     """Train PPO agent with optional LightGBM-backed demand simulation."""
+    category_label = _training_category_label(product_category, random_category)
     print("=" * 60)
     print("PPO Training for Dynamic Pricing")
     print("=" * 60)
     print(f"Total timesteps: {total_timesteps:,}")
     print(f"Demand model:    {'LightGBM' if use_demand_model else 'analytical'}")
-    print(f"Category:        {product_category}")
+    if random_category:
+        print(f"Category mode:   random per episode ({', '.join(PRODUCT_CATEGORIES)})")
+    else:
+        print(f"Category:        {product_category}")
+    print(f"Checkpoint tag:  {category_label} -> {ppo_model_path(category_label).name}")
     print(f"Save directory:  {save_dir}")
     print(f"Seed:            {seed}")
     print("=" * 60)
 
     demand_predictor = load_demand_predictor() if use_demand_model else None
 
-    if compare_before_train:
+    baseline_category = (
+        DEFAULT_PRODUCT_CATEGORY if random_category else product_category
+    )
+    if compare_before_train and not random_category:
         compare_baselines(
             demand_predictor=demand_predictor,
-            product_category=product_category,
+            product_category=baseline_category,
             n_episodes=5,
             seed=seed,
         )
+    elif compare_before_train and random_category:
+        print("\n(Skipping single-category baseline — training on all categories)\n")
 
     save_dir.mkdir(exist_ok=True)
     log_dir.mkdir(exist_ok=True)
@@ -171,12 +205,22 @@ def train_ppo(
 
     print("\n[1/5] Creating training environment...")
     train_env = DummyVecEnv([
-        make_env(seed=seed, demand_predictor=demand_predictor, product_category=product_category)
+        make_env(
+            seed=seed,
+            demand_predictor=demand_predictor,
+            product_category=product_category,
+            random_category=random_category,
+        )
     ])
 
     print("[2/5] Creating evaluation environment...")
     eval_env = DummyVecEnv([
-        make_env(seed=seed + 1000, demand_predictor=demand_predictor, product_category=product_category)
+        make_env(
+            seed=seed + 1000,
+            demand_predictor=demand_predictor,
+            product_category=product_category,
+            random_category=random_category,
+        )
     ])
 
     print("[3/5] Initializing PPO model...")
@@ -238,19 +282,29 @@ def train_ppo(
         f.write(f"Total timesteps: {total_timesteps}\n")
         f.write(f"Seed: {seed}\n")
         f.write(f"Demand model: {use_demand_model}\n")
-        f.write(f"Product category: {product_category}\n")
+        f.write(f"Product category: {category_label}\n")
+        f.write(f"Random category per episode: {random_category}\n")
         f.write(f"Learning rate: {LEARNING_RATE}\n")
         f.write(f"N steps: {N_STEPS}\n")
         f.write(f"Batch size: {BATCH_SIZE}\n")
 
     best_model_path = save_dir / "best_model" / "best_model.zip"
     if best_model_path.exists():
-        print(f"\nBest model saved to: {best_model_path}")
+        archived = archive_best_model(
+            category_label,
+            source=best_model_path,
+            timesteps=total_timesteps,
+            run_name=run_name,
+        )
+        print(f"\nBest model archived to: {archived}")
+        eval_category = (
+            DEFAULT_PRODUCT_CATEGORY if random_category else product_category
+        )
         evaluate_model(
-            str(best_model_path),
+            str(archived),
             n_episodes=EVAL_EPISODES,
             demand_predictor=demand_predictor,
-            product_category=product_category,
+            product_category=eval_category,
             seed=seed + 2000,
         )
     else:
@@ -344,7 +398,17 @@ if __name__ == "__main__":
         "--category",
         type=str,
         default=DEFAULT_PRODUCT_CATEGORY,
-        help="Product category for demand model",
+        help=(
+            "Product category (Books, Clothing, ...) or 'all' for random category "
+            "each episode. Ignored when --train-all-categories is set."
+        ),
+    )
+    parser.add_argument(
+        "--train-all-categories",
+        action="store_true",
+        help=(
+            "Train one PPO per category sequentially; saves best_model_<slug>.zip each"
+        ),
     )
     parser.add_argument(
         "--no-demand-model",
@@ -367,19 +431,44 @@ if __name__ == "__main__":
     args = parser.parse_args()
     use_demand = not args.no_demand_model
 
+    category_arg = normalize_category_arg(args.category)
+
     if args.evaluate:
         evaluate_model(
             args.evaluate,
             n_episodes=args.eval_episodes,
-            product_category=args.category,
+            product_category=(
+                DEFAULT_PRODUCT_CATEGORY
+                if category_arg == MULTI_CATEGORY_KEY
+                else category_arg
+            ),
             use_demand_model=use_demand,
             seed=args.seed,
         )
+    elif args.train_all_categories:
+        print("=" * 60)
+        print("Training separate PPO policies for each category")
+        print("=" * 60)
+        for cat in PRODUCT_CATEGORIES:
+            print(f"\n>>> Category: {cat}\n")
+            train_ppo(
+                total_timesteps=args.timesteps,
+                seed=args.seed,
+                use_demand_model=use_demand,
+                product_category=cat,
+                compare_before_train=not args.no_baseline_compare,
+                random_category=False,
+            )
+        print("\nAll category models saved under models/best_model/")
     else:
+        random_cat = category_arg == MULTI_CATEGORY_KEY
         train_ppo(
             total_timesteps=args.timesteps,
             seed=args.seed,
             use_demand_model=use_demand,
-            product_category=args.category,
+            product_category=(
+                DEFAULT_PRODUCT_CATEGORY if random_cat else category_arg
+            ),
             compare_before_train=not args.no_baseline_compare,
+            random_category=random_cat,
         )

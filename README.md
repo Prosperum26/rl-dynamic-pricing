@@ -64,8 +64,19 @@ python -m training.train_demand_predictor
 
 ### 4. Train PPO agent
 
+One policy per category (recommended for Streamlit demo):
+
 ```bash
-python -m training.train_ppo --timesteps 50000 --category Books
+python -m training.train_ppo --train-all-categories --timesteps 100000
+```
+
+Saves `models/best_model/best_model_books.zip`, `best_model_clothing.zip`, etc.
+
+Single category or one shared multi-category policy:
+
+```bash
+python -m training.train_ppo --timesteps 100000 --category Books
+python -m training.train_ppo --timesteps 100000 --category all
 ```
 
 ### 5. Dashboard
@@ -92,7 +103,7 @@ scripts/preprocess_ecommerce.py  -->  data/processed/processed_sales.csv
 training/train_demand_predictor.py  -->  models/demand_*.joblib
       |
       v
-training/train_ppo.py  -->  models/best_model/best_model.zip
+training/train_ppo.py  -->  models/best_model/best_model_<category>.zip
       |
       v
 dashboard/streamlit_app.py
@@ -115,8 +126,10 @@ Edit [`config/constants.py`](config/constants.py) for price grid, inventory, cat
 | `python -m scripts.preprocess_ecommerce` | Raw CSV → processed |
 | `python -m scripts.generate_data` | Synthetic data → `data/synthetic/` |
 | `python -m training.train_demand_predictor` | Train LightGBM |
-| `python -m training.train_ppo --timesteps N` | Train PPO |
-| `python -m training.train_ppo --evaluate models/best_model/best_model.zip` | Evaluate |
+| `python -m training.train_ppo --timesteps N --category Books` | Train PPO for one category |
+| `python -m training.train_ppo --train-all-categories --timesteps N` | Train all 4 category policies |
+| `python -m training.train_ppo --category all` | One PPO, random category each episode |
+| `python -m training.train_ppo --evaluate models/best_model/best_model_books.zip` | Evaluate |
 | `streamlit run dashboard/streamlit_app.py` | Web UI |
 
 ## Git vs local files

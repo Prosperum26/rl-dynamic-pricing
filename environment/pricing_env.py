@@ -24,6 +24,7 @@ from config.constants import (
     EPISODE_LENGTH, REWARD_SCALE, RANDOM_SEED,
     DEFAULT_PRODUCT_CATEGORY,
 )
+from training.simulation_context import demand_to_sales_units
 
 
 class PricingEnv(gym.Env):
@@ -114,25 +115,24 @@ class PricingEnv(gym.Env):
     
     def _get_info(self) -> Dict[str, Any]:
         """Return additional info for debugging."""
-        return {
+        info = {
             "day": self.current_day,
             "price": PRICE_LEVELS[self.current_price_idx],
             "inventory": self.inventory,
             "total_revenue": self.total_revenue,
-            "total_profit": self.total_profit
+            "total_profit": self.total_profit,
         }
-    
-    def _compute_demand(self, price: float) -> int:
+        if hasattr(self, "_last_demand"):
+            info["demand"] = self._last_demand
+            info["sales"] = self._last_sales
+        return info
+
+    def _compute_demand(self, price: float) -> float:
         """
-        Compute demand based on price and day.
-        
-        Uses a simple demand model with:
-        - Base demand
-        - Price elasticity (linear for simplicity)
-        - Weekly seasonality
-        - Random noise
-        
-        If demand_predictor is provided, uses ML model instead.
+        Expected demand (fractional units) for the day at ``price``.
+
+        ML path uses price-mapped discount/transaction context (see demand_features).
+        Sales are derived separately via ceil(demand) capped by inventory.
         """
         if self.demand_predictor is not None:
             if hasattr(self.demand_predictor, "predict_demand"):
@@ -143,7 +143,6 @@ class PricingEnv(gym.Env):
                     category=self.product_category,
                 )
             else:
-                # Legacy sklearn-style model (no category support)
                 features = np.array([[
                     price,
                     self.day_of_week,
@@ -151,33 +150,24 @@ class PricingEnv(gym.Env):
                     int(self.day_of_week >= 5),
                     int(self.month in [11, 12]),
                 ]])
-                demand = self.demand_predictor.predict(features)[0]
+                demand = float(self.demand_predictor.predict(features)[0])
         else:
-            # Simple analytical demand model
             base = BASE_DEMAND
-            
-            # Price effect: higher price = lower demand
             price_effect = PRICE_ELASTICITY * (price - MIN_PRICE)
-            
-            # Seasonality: peak on weekends (days 5, 6)
             day_of_week = self.current_day % 7
             seasonality = SEASONALITY_AMPLITUDE * np.sin(
                 2 * np.pi * day_of_week / SEASONALITY_PERIOD
             )
-            
-            # Add randomness
             noise = self._rng.normal(0, DEMAND_NOISE_STD)
-            
             demand = base + price_effect + seasonality + noise
-        
-        # Ensure non-negative and integer
-        return max(0, int(round(demand)))
-    
+
+        return float(max(0.0, demand))
+
     def _compute_reward(
-        self, 
-        price: float, 
-        demand: int, 
-        sales: int
+        self,
+        price: float,
+        demand: float,
+        sales: int,
     ) -> float:
         """
         Compute reward (profit) for the day.
@@ -272,11 +262,10 @@ class PricingEnv(gym.Env):
         self.current_price_idx = action
         price = PRICE_LEVELS[action]
         
-        # Compute demand at this price
         demand = self._compute_demand(price)
-        
-        # Actual sales limited by inventory
-        sales = min(demand, self.inventory)
+        sales = demand_to_sales_units(demand, self.inventory)
+        self._last_demand = demand
+        self._last_sales = sales
         
         # Update inventory
         self.inventory -= sales

@@ -50,6 +50,7 @@ from dashboard.product_data import (
     load_product_monthly,
     top_products_in_period,
 )
+from training.ppo_paths import list_available_ppo_models, resolve_ppo_path_for_category
 
 # ---------------------------------------------------------------------------
 # Page config & styling
@@ -78,7 +79,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-DEFAULT_PPO_PATH = MODELS_DIR / "best_model" / "best_model.zip"
+LEGACY_PPO_PATH = MODELS_DIR / "best_model" / "best_model.zip"
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTH_NAMES = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -172,19 +173,44 @@ page = st.sidebar.radio(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Models")
-
-ppo_path = st.sidebar.text_input(
-    "PPO model path",
-    value=str(DEFAULT_PPO_PATH),
-)
-use_ppo = st.sidebar.checkbox("Use trained PPO", value=True)
+st.sidebar.subheader("Market")
 
 category = st.sidebar.selectbox(
     "Product category",
     PRODUCT_CATEGORIES,
     index=PRODUCT_CATEGORIES.index(DEFAULT_PRODUCT_CATEGORY),
 )
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Models")
+
+auto_ppo_path = resolve_ppo_path_for_category(category)
+ppo_auto_mode = st.sidebar.checkbox(
+    "Auto PPO per category",
+    value=True,
+    help="Load models/best_model/best_model_<category>.zip when available.",
+)
+
+if ppo_auto_mode:
+    resolved_ppo = auto_ppo_path
+    if resolved_ppo.exists():
+        st.sidebar.caption(f"PPO: `{resolved_ppo.name}`")
+    else:
+        st.sidebar.caption("PPO: no checkpoint for this category yet")
+    ppo_path = str(resolved_ppo)
+else:
+    ppo_path = st.sidebar.text_input(
+        "PPO model path",
+        value=str(auto_ppo_path if auto_ppo_path.exists() else LEGACY_PPO_PATH),
+    )
+
+use_ppo = st.sidebar.checkbox("Use trained PPO", value=True)
+
+available_ppo = list_available_ppo_models()
+if available_ppo:
+    with st.sidebar.expander("Available PPO checkpoints"):
+        for label, path in sorted(available_ppo.items()):
+            st.text(f"{label}: {path.name}")
 
 use_ml_demand = st.sidebar.checkbox(
     "Use LightGBM demand model",
@@ -204,6 +230,11 @@ if use_ppo and Path(ppo_path).exists():
         st.sidebar.markdown(f'<p class="status-miss">✗ PPO: {exc}</p>', unsafe_allow_html=True)
 elif use_ppo:
     st.sidebar.markdown('<p class="status-miss">✗ PPO file not found</p>', unsafe_allow_html=True)
+    if ppo_auto_mode:
+        st.sidebar.caption(
+            f"Train: `python -m training.train_ppo --category {category}` "
+            f"or `--train-all-categories`"
+        )
 
 if use_ml_demand and MODEL_PATH.exists():
     try:
@@ -260,7 +291,8 @@ if page == "🏠 Overview":
     with right:
         st.subheader("Model status")
         status_rows = [
-            ("PPO agent", "Ready" if ppo_model else "Not loaded", ppo_path),
+            ("PPO agent", "Ready" if ppo_model else "Not loaded", Path(ppo_path).name),
+            ("PPO path", "auto" if ppo_auto_mode else "manual", str(Path(ppo_path))),
             ("Demand predictor", "Ready" if demand_predictor else "Not loaded", str(MODEL_PATH)),
             ("Active category", category, ""),
         ]
@@ -278,7 +310,10 @@ if page == "🏠 Overview":
 
 elif page == "🎮 Live simulation":
     st.title("🎮 Live pricing simulation")
-    st.caption("Run a multi-day episode with the trained PPO policy and LightGBM demand.")
+    st.caption(
+        "Episode với PPO + LightGBM. Demand là **float**; sales = ceil(demand) giới hạn tồn kho. "
+        "Discount/transaction_count trong ML suy từ giá (price context)."
+    )
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -376,7 +411,13 @@ elif page == "🎮 Live simulation":
             col=1,
         )
         fig.add_trace(
-            go.Bar(x=history["day"], y=history["demands"], name="Demand", marker_color="#94a3b8"),
+            go.Scatter(
+                x=history["day"],
+                y=history["demands"],
+                mode="lines+markers",
+                name="Demand (float)",
+                line=dict(color="#94a3b8", width=2),
+            ),
             row=2,
             col=1,
         )
@@ -385,7 +426,7 @@ elif page == "🎮 Live simulation":
                 x=history["day"],
                 y=history["sales"],
                 mode="markers",
-                name="Sales",
+                name="Sales (ceil)",
                 marker=dict(color="#3dd68c", size=9),
             ),
             row=2,

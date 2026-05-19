@@ -2,7 +2,8 @@
 Feature engineering for global demand forecasting (all product categories).
 
 Training uses full aggregated fields (discount rate, transaction volume).
-At inference (RL env), missing values are filled from per-category training averages.
+At inference in RL simulation, discount_rate and transaction_count are mapped from
+price via training/fit rules (see simulation_context.py) so demand responds to price.
 """
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ from config.constants import (
     PROCESSED_SALES_PATH,
     PRODUCT_CATEGORIES,
     RANDOM_SEED,
+)
+from training.simulation_context import (
+    fit_category_price_rules,
+    infer_discount_rate,
+    infer_transaction_count,
 )
 
 PROCESSED_REQUIRED_COLUMNS = [
@@ -122,6 +128,7 @@ class DemandFeatureEncoder:
         self.feature_names_: List[str] = []
         self.category_stats_: Dict[str, Dict[str, float]] = {}
         self.global_stats_: Dict[str, float] = {}
+        self.price_rules_: Dict[str, Dict[str, float]] = {}
 
     def fit(self, df: pd.DataFrame) -> "DemandFeatureEncoder":
         seen = sorted(df["category"].unique().tolist())
@@ -144,6 +151,7 @@ class DemandFeatureEncoder:
             "mean_discount_rate": float(df["avg_discount_rate"].mean()),
             "mean_transaction_count": float(df["transaction_count"].mean()),
         }
+        self.price_rules_ = fit_category_price_rules(df)
 
         self.feature_names_ = INFERENCE_FEATURE_COLS + [
             f"category_{c.replace(' ', '_').replace('&', 'and')}" for c in self.categories
@@ -152,6 +160,33 @@ class DemandFeatureEncoder:
 
     def _category_column_name(self, category: str) -> str:
         return f"category_{category.replace(' ', '_').replace('&', 'and')}"
+
+    def context_from_price(
+        self,
+        price: float,
+        category: str = DEFAULT_PRODUCT_CATEGORY,
+    ) -> Tuple[float, float]:
+        """Discount rate and transaction count implied by a simulation price."""
+        rules = getattr(self, "price_rules_", None) or {}
+        if rules:
+            return (
+                infer_discount_rate(price, category, rules, self.global_stats_),
+                infer_transaction_count(price, category, rules, self.global_stats_),
+            )
+        stats = self.category_stats_.get(category, self.global_stats_)
+        median = stats.get("median_price", self.global_stats_.get("median_price", price))
+        from training.simulation_context import (
+            _power_law_discount,
+            _power_law_transaction_count,
+        )
+        return (
+            _power_law_discount(
+                price, median, stats.get("mean_discount_rate", 0.08)
+            ),
+            _power_law_transaction_count(
+                price, median, stats.get("mean_transaction_count", 2.0)
+            ),
+        )
 
     def _enrich(self, df: pd.DataFrame) -> pd.DataFrame:
         out = _cyclical_features(df.copy())
@@ -205,13 +240,12 @@ class DemandFeatureEncoder:
         is_weekend: Optional[int] = None,
         is_holiday_season: Optional[int] = None,
     ) -> np.ndarray:
-        stats = self.category_stats_.get(category, self.global_stats_)
-        if discount_rate is None:
-            discount_rate = stats.get("mean_discount_rate", self.global_stats_["mean_discount_rate"])
-        if transaction_count is None:
-            transaction_count = stats.get(
-                "mean_transaction_count", self.global_stats_["mean_transaction_count"]
-            )
+        if discount_rate is None or transaction_count is None:
+            inferred_dr, inferred_txn = self.context_from_price(price, category)
+            if discount_rate is None:
+                discount_rate = inferred_dr
+            if transaction_count is None:
+                transaction_count = inferred_txn
         if is_weekend is None:
             is_weekend = int(day_of_week >= 5)
         if is_holiday_season is None:
