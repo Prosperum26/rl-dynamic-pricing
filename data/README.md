@@ -6,9 +6,12 @@
 
 ```
 data/
-├── raw/           # Transaction-level exports (not in git)
-├── processed/     # Aggregated training tables (not in git)
-└── synthetic/     # Optional generated data for testing (not in git)
+├── raw/              # Transaction-level exports (not in git)
+├── processed/        # Aggregated tables (not in git)
+│   ├── processed_sales.csv    # day × category (RL + LightGBM)
+│   ├── product_daily.csv      # day × product_id × category
+│   └── product_monthly.csv    # month × product_id × category
+└── synthetic/        # Optional generated data (not in git)
 ```
 
 ## Setup
@@ -20,12 +23,14 @@ data/
 2. Run preprocessing (from project root):
 
    ```bash
-   python -m scripts.preprocess_ecommerce
+   python -m scripts.preprocess_ecommerce --with-products
    ```
 
-3. Output appears at:
+3. Outputs:
 
-   `data/processed/processed_sales.csv`
+   - `data/processed/processed_sales.csv` — category-level (train RL)
+   - `data/processed/product_daily.csv` — product-level daily
+   - `data/processed/product_monthly.csv` — product-level monthly (dashboard)
 
 ## File reference
 

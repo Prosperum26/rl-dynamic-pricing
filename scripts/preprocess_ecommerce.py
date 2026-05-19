@@ -22,13 +22,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.constants import PROCESSED_SALES_PATH, RAW_SALES_PATH
-
-REQUIRED_RAW_COLUMNS = [
-    "Product_Category",
-    "Price",
-    "Discount",
-    "Purchase_Timestamp",
-]
+from scripts.preprocess_common import (
+    add_effective_price,
+    add_time_features,
+    clean_transactions,
+    load_raw_data,
+    validate_raw_data,
+)
 
 PROCESSED_COLUMNS = [
     "date",
@@ -44,78 +44,6 @@ PROCESSED_COLUMNS = [
     "is_weekend",
     "is_holiday_season",
 ]
-
-PURCHASE_PROB_COL = "Purchase Probability"
-
-
-def load_raw_data(input_path: Path) -> pd.DataFrame:
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-
-    df = pd.read_csv(input_path)
-
-    if PURCHASE_PROB_COL in df.columns:
-        df = df.rename(columns={PURCHASE_PROB_COL: "purchase_probability"})
-    elif "purchase_probability" not in df.columns:
-        raise ValueError(
-            f"Missing purchase probability column. Expected '{PURCHASE_PROB_COL}' "
-            "or 'purchase_probability'."
-        )
-
-    return df
-
-
-def validate_raw_data(df: pd.DataFrame) -> None:
-    missing = [col for col in REQUIRED_RAW_COLUMNS if col not in df.columns]
-    if missing:
-        raise ValueError(f"Raw dataset is missing required columns: {missing}")
-    if "purchase_probability" not in df.columns:
-        raise ValueError("Raw dataset must include purchase probability.")
-    if len(df) == 0:
-        raise ValueError("Raw dataset is empty.")
-
-
-def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
-    n_start = len(df)
-    df = df.dropna(
-        subset=["Purchase_Timestamp", "Price", "purchase_probability", "Product_Category"]
-    ).copy()
-    df["purchase_probability"] = df["purchase_probability"].clip(0.0, 1.0)
-    df = df[df["Price"] > 0]
-    df["Discount"] = df["Discount"].fillna(0).clip(lower=0)
-    df.loc[df["Discount"] > df["Price"], "Discount"] = df.loc[
-        df["Discount"] > df["Price"], "Price"
-    ]
-    n_dropped = n_start - len(df)
-    if n_dropped > 0:
-        print(f"  Dropped or fixed rows: {n_dropped} removed, {len(df)} remaining")
-    return df
-
-
-def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["Purchase_Timestamp"] = pd.to_datetime(df["Purchase_Timestamp"], errors="coerce")
-    invalid_dates = df["Purchase_Timestamp"].isna().sum()
-    if invalid_dates > 0:
-        print(f"  Warning: {invalid_dates} rows have unparseable timestamps (dropped)")
-        df = df.dropna(subset=["Purchase_Timestamp"])
-
-    df["date"] = df["Purchase_Timestamp"].dt.normalize()
-    df["day_of_week"] = df["Purchase_Timestamp"].dt.dayofweek
-    df["month"] = df["Purchase_Timestamp"].dt.month
-    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
-    return df
-
-
-def compute_effective_price(df: pd.DataFrame, apply_discount: bool = True) -> pd.DataFrame:
-    df = df.copy()
-    if apply_discount:
-        discount_rate = (df["Discount"] / df["Price"]).clip(0.0, 1.0)
-        df["effective_price"] = df["Price"] * (1.0 - discount_rate)
-    else:
-        df["effective_price"] = df["Price"]
-    return df
-
 
 def aggregate_by_date_category(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -186,9 +114,9 @@ def preprocess(
 
     df = load_raw_data(input_path)
     validate_raw_data(df)
-    df = handle_missing_values(df)
+    df = clean_transactions(df)
     df = add_time_features(df)
-    df = compute_effective_price(df, apply_discount=apply_discount)
+    df = add_effective_price(df, apply_discount=apply_discount)
     processed = aggregate_by_date_category(df)
     validate_processed_data(processed)
 
@@ -208,6 +136,11 @@ def main() -> None:
     parser.add_argument("--input", type=Path, default=RAW_SALES_PATH)
     parser.add_argument("--output", type=Path, default=PROCESSED_SALES_PATH)
     parser.add_argument("--no-apply-discount", action="store_true")
+    parser.add_argument(
+        "--with-products",
+        action="store_true",
+        help="Also run product-level preprocessing (product_daily + product_monthly)",
+    )
     args = parser.parse_args()
 
     try:
@@ -216,6 +149,18 @@ def main() -> None:
             output_path=args.output,
             apply_discount=not args.no_apply_discount,
         )
+        if args.with_products:
+            from scripts.preprocess_products import preprocess_products
+            from config.constants import (
+                PROCESSED_PRODUCT_DAILY_PATH,
+                PROCESSED_PRODUCT_MONTHLY_PATH,
+            )
+            preprocess_products(
+                input_path=args.input,
+                daily_output=PROCESSED_PRODUCT_DAILY_PATH,
+                monthly_output=PROCESSED_PRODUCT_MONTHLY_PATH,
+                apply_discount=not args.no_apply_discount,
+            )
     except (FileNotFoundError, ValueError) as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         sys.exit(1)

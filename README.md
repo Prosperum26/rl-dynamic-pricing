@@ -130,6 +130,10 @@ Edit [`config/constants.py`](config/constants.py) for price grid, inventory, cat
 - Python 3.10+
 - ~8 GB RAM (CPU is fine for this MVP)
 
+## Documentation
+
+- **[README_LEARNING.md](README_LEARNING.md)** — Giải thích chi tiết toàn project (tiếng Việt): data, training, Streamlit, giới hạn dataset & model.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

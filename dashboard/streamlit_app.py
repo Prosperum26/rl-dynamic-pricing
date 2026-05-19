@@ -45,6 +45,11 @@ from training.demand_features import (
     DemandPredictorWrapper,
     load_metadata,
 )
+from dashboard.product_data import (
+    load_product_daily,
+    load_product_monthly,
+    top_products_in_period,
+)
 
 # ---------------------------------------------------------------------------
 # Page config & styling
@@ -162,6 +167,7 @@ page = st.sidebar.radio(
         "🔮 What-if explorer",
         "📊 Strategy comparison",
         "📈 Training metrics",
+        "🛍️ Product insights",
     ],
 )
 
@@ -247,6 +253,7 @@ if page == "🏠 Overview":
             2. **Train demand** → LightGBM (global, per category)  
             3. **Train PPO** → pricing policy in simulated market  
             4. **Explore here** → simulate, what-if, compare strategies  
+            5. **Product insights** → top SKU demand theo tháng/năm (từ raw)  
             """
         )
 
@@ -641,9 +648,158 @@ elif page == "📈 Training metrics":
         m2.metric("R² (demand > 0)", f"{metrics.get('r2_demand_positive', 0):.4f}")
         m3.metric("MAPE", f"{metrics.get('mape', 0):.1%}" if metrics.get("mape") is not None else "—")
         m4.metric("RMSE / MAE", f"{metrics.get('rmse', 0):.2f} / {metrics.get('mae', 0):.2f}")
-
         with st.expander("Feature list & hyperparameters"):
             st.json(demand_meta)
+
+
+# ---------------------------------------------------------------------------
+# Product insights (Direction B — SKU-level from raw aggregates)
+# ---------------------------------------------------------------------------
+
+elif page == "🛍️ Product insights":
+    st.title("🛍️ Product insights")
+    st.caption(
+        "Phân tích theo **Product_ID** từ dữ liệu gốc (không dùng model RL). "
+        "Chạy `python -m scripts.preprocess_products` nếu chưa có file processed."
+    )
+
+    product_monthly = load_product_monthly()
+    product_daily = load_product_daily()
+
+    if product_monthly.empty:
+        st.error(
+            f"Chưa có `product_monthly.csv`. Chạy:\n\n"
+            f"`python -m scripts.preprocess_products` hoặc\n"
+            f"`python -m scripts.preprocess_ecommerce --with-products`"
+        )
+        st.stop()
+
+    years = sorted(product_monthly["year"].unique())
+    insight_category = st.selectbox(
+        "Category",
+        PRODUCT_CATEGORIES,
+        index=PRODUCT_CATEGORIES.index(category),
+        key="insight_category",
+    )
+    insight_year = st.selectbox("Year", years, index=len(years) - 1, key="insight_year")
+
+    period_mode = st.radio(
+        "Time window",
+        ["Single month", "Full year"],
+        horizontal=True,
+    )
+    insight_month = None
+    if period_mode == "Single month":
+        months_available = sorted(
+            product_monthly.loc[
+                (product_monthly["category"] == insight_category)
+                & (product_monthly["year"] == insight_year),
+                "month",
+            ].unique()
+        )
+        if not months_available:
+            st.warning("No data for this category/year.")
+            st.stop()
+        insight_month = st.selectbox(
+            "Month",
+            months_available,
+            format_func=lambda m: MONTH_NAMES[int(m) - 1],
+            key="insight_month",
+        )
+
+    top_n = st.slider("Top N products", 5, 30, 10)
+    sort_metric = st.selectbox(
+        "Rank by",
+        ["demand", "revenue_proxy", "transaction_count"],
+        format_func=lambda x: {
+            "demand": "Conversions (sum probability)",
+            "revenue_proxy": "Revenue proxy",
+            "transaction_count": "Transactions",
+        }[x],
+    )
+
+    top_df = top_products_in_period(
+        product_monthly,
+        category=insight_category,
+        year=int(insight_year),
+        month=int(insight_month) if insight_month else None,
+        top_n=top_n,
+        sort_by=sort_metric,
+    )
+
+    period_label = (
+        f"{MONTH_NAMES[int(insight_month) - 1]} {insight_year}"
+        if insight_month
+        else f"Full year {insight_year}"
+    )
+
+    st.subheader(f"Top {top_n} products — {insight_category}, {period_label}")
+
+    if top_df.empty:
+        st.info("No products in this selection.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total demand (top N)", f"{top_df['demand'].sum():.0f}")
+        c2.metric("Total transactions", f"{int(top_df['transaction_count'].sum())}")
+        c3.metric("Top product share", f"{top_df['share_pct'].iloc[0]:.1f}%")
+
+        display_df = top_df.rename(columns={
+            "product_id": "Product ID",
+            "demand": "Demand",
+            "transaction_count": "Transactions",
+            "avg_price": "Avg price ($)",
+            "revenue_proxy": "Revenue proxy ($)",
+            "share_pct": "Share (%)",
+        })
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        fig_bar = px.bar(
+            top_df,
+            x="product_id",
+            y=sort_metric,
+            title=f"Top products by {sort_metric}",
+            labels={"product_id": "Product ID", sort_metric: sort_metric},
+            text=sort_metric,
+        )
+        fig_bar.update_layout(template="plotly_dark", xaxis_tickangle=-45)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Demand trend for one product")
+
+    if not product_daily.empty:
+        products_in_cat = sorted(
+            product_daily.loc[product_daily["category"] == insight_category, "product_id"].unique()
+        )
+        selected_product = st.selectbox("Product ID", products_in_cat, key="trend_product")
+        trend = product_daily[
+            (product_daily["product_id"] == selected_product)
+            & (product_daily["category"] == insight_category)
+        ].sort_values("date")
+
+        if trend.empty:
+            st.info("No daily series for this product.")
+        else:
+            fig_trend = px.line(
+                trend,
+                x="date",
+                y="demand",
+                title=f"Daily demand — {selected_product} ({insight_category})",
+                markers=True,
+            )
+            fig_trend.update_layout(template="plotly_dark", height=360)
+            st.plotly_chart(fig_trend, use_container_width=True)
+    else:
+        st.caption("Daily product file not found; only monthly rankings available.")
+
+    with st.expander("Data source note"):
+        st.markdown(
+            """
+            - **demand** = tổng `Purchase Probability` (0/1) theo ngày hoặc tháng  
+            - **revenue_proxy** = tổng `effective_price × probability`  
+            - Đây là **lịch sử quan sát**, khác với **Live simulation** (model + PPO dự báo tương lai)
+            """
+        )
 
 
 # Footer
