@@ -41,6 +41,11 @@ data/synthetic/*
 !data/processed/.gitkeep
 !data/synthetic/.gitkeep
 
+# Benchmark report outputs (regenerate with scripts/run_benchmark.py)
+reports/benchmark/**/*
+!reports/benchmark/README.md
+!reports/benchmark/.gitkeep
+
 # Archives
 *.zip
 README_LEARNING.md

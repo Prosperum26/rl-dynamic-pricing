@@ -449,17 +449,27 @@ if __name__ == "__main__":
         print("=" * 60)
         print("Training separate PPO policies for each category")
         print("=" * 60)
+        failures = []
         for cat in PRODUCT_CATEGORIES:
             print(f"\n>>> Category: {cat}\n")
-            train_ppo(
-                total_timesteps=args.timesteps,
-                seed=args.seed,
-                use_demand_model=use_demand,
-                product_category=cat,
-                compare_before_train=not args.no_baseline_compare,
-                random_category=False,
-            )
-        print("\nAll category models saved under models/best_model/")
+            try:
+                train_ppo(
+                    total_timesteps=args.timesteps,
+                    seed=args.seed,
+                    use_demand_model=use_demand,
+                    product_category=cat,
+                    compare_before_train=not args.no_baseline_compare,
+                    random_category=False,
+                )
+            except Exception as exc:
+                failures.append((cat, exc))
+                print(f"\n[ERROR] Training failed for {cat}: {exc}\n")
+        if failures:
+            print("Completed with errors:")
+            for cat, exc in failures:
+                print(f"  - {cat}: {exc}")
+        else:
+            print("\nAll category models saved under models/best_model/")
     else:
         random_cat = category_arg == MULTI_CATEGORY_KEY
         train_ppo(

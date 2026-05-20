@@ -130,6 +130,7 @@ Edit [`config/constants.py`](config/constants.py) for price grid, inventory, cat
 | `python -m training.train_ppo --train-all-categories --timesteps N` | Train all 4 category policies |
 | `python -m training.train_ppo --category all` | One PPO, random category each episode |
 | `python -m training.train_ppo --evaluate models/best_model/best_model_books.zip` | Evaluate |
+| `python -m scripts.run_benchmark` | Offline benchmark → `reports/benchmark/` (CSV + MD) |
 | `streamlit run dashboard/streamlit_app.py` | Web UI |
 
 ## Git vs local files

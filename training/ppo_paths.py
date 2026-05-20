@@ -66,8 +66,15 @@ def archive_best_model(
 
     PPO_BEST_DIR.mkdir(parents=True, exist_ok=True)
     dest = ppo_model_path(category)
-    shutil.copy2(src, dest)
-    shutil.copy2(src, LEGACY_BEST_PATH)
+    src_resolved = src.resolve()
+    dest_resolved = dest.resolve()
+    legacy_resolved = LEGACY_BEST_PATH.resolve()
+
+    if src_resolved != dest_resolved:
+        shutil.copy2(src, dest)
+    # EvalCallback already writes best_model.zip; do not copy onto itself
+    if legacy_resolved not in (src_resolved, dest_resolved):
+        shutil.copy2(src, LEGACY_BEST_PATH)
 
     meta = {
         "category": category,
