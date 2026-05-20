@@ -16,6 +16,8 @@ data/
 
 ## Setup
 
+See the main **[README.md](../README.md)** for the full clone → train roadmap.
+
 1. Place your raw file here:
 
    `data/raw/ecommerce_dynamic_pricing_dataset.csv`
