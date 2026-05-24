@@ -311,8 +311,9 @@ if page == "🏠 Overview":
 elif page == "🎮 Live simulation":
     st.title("🎮 Live pricing simulation")
     st.caption(
-        "Episode với PPO + LightGBM. Demand là **float**; sales = ceil(demand) giới hạn tồn kho. "
-        "Discount/transaction_count trong ML suy từ giá (price context)."
+        "Episode với PPO + LightGBM. Obs gồm tháng (sin/cos) + category. "
+        "Demand float; sales = ceil(demand). Giá có thể đổi theo mùa/context — "
+        "policy mới (obs v2) cần train lại PPO."
     )
 
     col1, col2, col3, col4 = st.columns(4)

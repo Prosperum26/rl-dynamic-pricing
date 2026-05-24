@@ -118,16 +118,26 @@ GAMMA = 0.99
 # Reward scaling (to help RL training stability)
 REWARD_SCALE = 0.01
 
-# Features in state representation
-STATE_FEATURES = [
-    "current_price_idx",    # Index of current price in PRICE_LEVELS
-    "inventory_level",      # Current stock level
-    "day_of_week",          # 0-6 (Monday-Sunday)
-    "days_until_holiday",   # Days until next holiday (or large number)
-    "price_elasticity",     # Estimated elasticity (if known)
-]
+# Observation: price, inventory, calendar, cyclical month, category one-hot
+N_CATEGORY_OBS = len(PRODUCT_CATEGORIES)
+OBS_BASE_DIM = 6  # price_idx_norm, inventory, dow, day_in_episode, month_sin, month_cos
+OBS_DIM = OBS_BASE_DIM + N_CATEGORY_OBS
 
-STATE_DIM = len(STATE_FEATURES)
+# Soft incentive to probe market after many days at the same price (not forced daily churn)
+PRICE_STAGNATION_DAYS = 5
+PRICE_STAGNATION_PENALTY_USD = 1.5   # per day beyond threshold (before REWARD_SCALE)
+PRICE_EXPLORATION_BONUS_USD = 4.0    # when changing price after a long flat spell
+
+# Legacy doc list (actual obs built in PricingEnv._get_obs)
+STATE_FEATURES = [
+    "price_idx_norm",
+    "inventory_norm",
+    "day_of_week_norm",
+    "day_in_episode_norm",
+    "month_sin",
+    "month_cos",
+    *[f"category_{c}" for c in PRODUCT_CATEGORIES],
+]
 
 # =============================================================================
 # PPO TRAINING CONFIGURATION
@@ -157,8 +167,8 @@ GAE_LAMBDA = 0.95
 # Clip range for PPO
 CLIP_RANGE = 0.2
 
-# Entropy coefficient (encourages exploration)
-ENT_COEF = 0.01
+# Entropy coefficient (encourages exploration; raised to reduce single-action collapse)
+ENT_COEF = 0.04
 
 # Value function coefficient
 VF_COEF = 0.5

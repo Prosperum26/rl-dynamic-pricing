@@ -41,6 +41,10 @@ from config.constants import (
     N_EPOCHS,
     N_PRICE_ACTIONS,
     N_STEPS,
+    OBS_DIM,
+    PRICE_EXPLORATION_BONUS_USD,
+    PRICE_STAGNATION_DAYS,
+    PRICE_STAGNATION_PENALTY_USD,
     PRODUCT_CATEGORIES,
     RANDOM_SEED,
     TOTAL_TIMESTEPS,
@@ -286,7 +290,13 @@ def train_ppo(
         f.write(f"Random category per episode: {random_category}\n")
         f.write(f"Learning rate: {LEARNING_RATE}\n")
         f.write(f"N steps: {N_STEPS}\n")
-        f.write(f"Batch size: {BATCH_SIZE}\n")
+        f.write(f"Observation dim: {OBS_DIM} (month cyclical + category one-hot)\n")
+        f.write(f"Entropy coef: {ENT_COEF}\n")
+        f.write(
+            f"Price stagnation: {PRICE_STAGNATION_DAYS} days, "
+            f"penalty ${PRICE_STAGNATION_PENALTY_USD}/day, "
+            f"explore bonus ${PRICE_EXPLORATION_BONUS_USD}\n"
+        )
 
     best_model_path = save_dir / "best_model" / "best_model.zip"
     if best_model_path.exists():
