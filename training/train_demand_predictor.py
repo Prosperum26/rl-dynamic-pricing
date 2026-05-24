@@ -16,6 +16,7 @@ from pathlib import Path
 import joblib
 import lightgbm as lgb
 import numpy as np
+import pandas as pd
 
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -34,6 +35,7 @@ from training.demand_features import (
     ENCODER_PATH,
     METADATA_PATH,
     MODEL_PATH,
+    add_demand_lag_features,
     load_processed_sales,
     save_metadata,
     time_based_split,
@@ -76,6 +78,66 @@ def generate_synthetic_data(n_samples: int = 5000, seed: int = RANDOM_SEED):
     })
 
 
+def walk_forward_evaluate(
+    df: pd.DataFrame,
+    n_folds: int = 4,
+    test_size: float = TRAIN_TEST_SPLIT,
+) -> dict:
+    """
+    Expanding-window evaluation by calendar month groups.
+
+    Returns mean metrics across folds for reporting simulator quality.
+    """
+    df = add_demand_lag_features(df)
+    df = df.sort_values("date").reset_index(drop=True)
+    months = sorted(df["date"].dt.to_period("M").unique())
+    if len(months) < n_folds + 1:
+        n_folds = max(1, len(months) - 1)
+
+    fold_metrics = []
+    min_train_months = max(2, len(months) // (n_folds + 1))
+    for fold in range(n_folds):
+        train_end_idx = min_train_months + fold
+        if train_end_idx >= len(months):
+            break
+        train_months = set(months[:train_end_idx])
+        test_month = months[train_end_idx]
+        train_df = df[df["date"].dt.to_period("M").isin(train_months)]
+        test_df = df[df["date"].dt.to_period("M") == test_month]
+        if len(train_df) < 20 or len(test_df) < 5:
+            continue
+
+        encoder = DemandFeatureEncoder()
+        encoder.fit(train_df)
+        X_train = encoder.transform(train_df)
+        y_train = train_df[DEMAND_TARGET_COL].values
+        X_test = encoder.transform(test_df)
+        y_test = test_df[DEMAND_TARGET_COL].values
+
+        model = lgb.LGBMRegressor(**LGB_PARAMS, random_state=RANDOM_SEED + fold)
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_test, y_test)],
+            eval_metric="rmse",
+            callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
+        )
+        y_pred = np.clip(model.predict(X_test), 0, None)
+        metrics = compute_demand_metrics(y_test, y_pred)
+        metrics["fold"] = fold
+        metrics["test_month"] = str(test_month)
+        fold_metrics.append(metrics)
+
+    if not fold_metrics:
+        return {"n_folds": 0}
+
+    keys = ["r2", "wmape", "rmse", "mae"]
+    summary = {k: float(np.mean([m[k] for m in fold_metrics])) for k in keys}
+    summary["n_folds"] = len(fold_metrics)
+    summary["folds"] = fold_metrics
+    return summary
+
+
 def train_model(
     data_path: str | None = None,
     save_model: bool = True,
@@ -83,7 +145,7 @@ def train_model(
     time_split: bool = True,
 ):
     print("=" * 60)
-    print("Training Global Demand Prediction Model (v2 features)")
+    print("Training Global Demand Prediction Model (v3: Tweedie + lags)")
     print("=" * 60)
 
     if data_path and os.path.exists(data_path):
@@ -102,6 +164,8 @@ def train_model(
         split_type = "random"
     else:
         raise ValueError("No data found. Run: python -m scripts.preprocess_ecommerce")
+
+    df = add_demand_lag_features(df)
 
     target_col = DEMAND_TARGET_COL
     print(f"Dataset: {df.shape[0]} rows, target={target_col}")
@@ -148,6 +212,16 @@ def train_model(
     print(f"\nTest metrics ({split_type} split):")
     print(format_metrics(metrics))
 
+    print("\nWalk-forward evaluation (by month)...")
+    wf = walk_forward_evaluate(df, n_folds=4)
+    if wf.get("n_folds", 0) > 0:
+        print(
+            f"  {wf['n_folds']} folds — mean R²={wf['r2']:.4f}, "
+            f"WMAPE={wf['wmape']:.2%}, RMSE={wf['rmse']:.3f}"
+        )
+    else:
+        print("  Skipped (insufficient monthly data)")
+
     print("\nFeature importance (top 10):")
     for name, imp in sorted(
         zip(encoder.feature_names_, model.feature_importances_),
@@ -162,17 +236,22 @@ def train_model(
 
         metadata = {
             "model_type": "LightGBM",
-            "model_version": 2,
+            "model_version": 3,
+            "objective": "tweedie",
             "target": target_col,
             "target_description": "daily conversion count per category",
             "global_model": True,
             "split_type": split_type,
             "simulation_price_context": True,
+            "simulation_elasticity_calibration": True,
+            "lag_features": ["demand_lag1", "demand_roll7_mean"],
             "features": encoder.feature_names_,
             "categories": encoder.categories,
             "category_stats": encoder.category_stats_,
             "price_rules": encoder.price_rules_,
+            "elasticity_rules": encoder.elasticity_rules_,
             "metrics": metrics,
+            "walk_forward": wf,
             "hyperparameters": LGB_PARAMS,
             "n_train": len(y_train),
             "n_test": len(y_test),

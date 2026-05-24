@@ -38,11 +38,13 @@ from training.demand_features import (
     MODEL_PATH,
     DemandFeatureEncoder,
     DemandPredictorWrapper,
+    add_demand_lag_features,
     load_processed_sales,
     time_based_split,
 )
 from training.demand_metrics import compute_demand_metrics
 from training.ppo_paths import list_available_ppo_models, ppo_model_path, resolve_ppo_path_for_category
+from training.pricing_baselines import default_pricing_strategies, myopic_policy
 from training.train_ppo import load_demand_predictor, run_episode
 
 
@@ -141,6 +143,7 @@ def evaluate_demand_benchmarks(
     Returns (summary_df, by_category_df, meta_dict).
     """
     df = load_processed_sales(data_path)
+    df = add_demand_lag_features(df)
     train_df, test_df = time_based_split(df, test_size=test_size)
     y_test = test_df[DEMAND_TARGET_COL].values
 
@@ -163,7 +166,7 @@ def evaluate_demand_benchmarks(
 
     lgb_pred = predict_lightgbm_saved(test_df)
     if lgb_pred is not None:
-        models.append(("lightgbm_v2", "project_mvp_demand", lambda: lgb_pred))
+        models.append(("lightgbm_v3", "project_mvp_demand", lambda: lgb_pred))
 
     summary_rows = []
     by_cat_rows = []
@@ -172,12 +175,12 @@ def evaluate_demand_benchmarks(
     for model_name, source_id, pred_fn in models:
         y_pred = np.clip(pred_fn(), 0, None)
         metrics = compute_demand_metrics(y_test, y_pred)
-        pass_r2 = metrics["r2"] >= DEMAND_R2_PASS if model_name == "lightgbm_v2" else None
+        pass_r2 = metrics["r2"] >= DEMAND_R2_PASS if model_name == "lightgbm_v3" else None
         beat_naive = None
 
-        if model_name != "lightgbm_v2" and not np.isnan(metrics.get("wmape", float("nan"))):
+        if model_name != "lightgbm_v3" and not np.isnan(metrics.get("wmape", float("nan"))):
             naive_wmapes.append((model_name, metrics["wmape"]))
-        elif model_name == "lightgbm_v2" and naive_wmapes:
+        elif model_name == "lightgbm_v3" and naive_wmapes:
             best_naive_wmape = min(w for _, w in naive_wmapes)
             beat_naive = metrics["wmape"] < best_naive_wmape
 
@@ -190,7 +193,7 @@ def evaluate_demand_benchmarks(
             "unit": "ratio",
             "benchmark_source_id": source_id,
             "pass": pass_r2 if pass_r2 is not None else "",
-            "notes": "MVP gate R²≥0.30" if model_name == "lightgbm_v2" else "",
+            "notes": "MVP gate R²≥0.30" if model_name == "lightgbm_v3" else "",
         })
         for mk, mv in [
             ("wmape", metrics["wmape"]),
@@ -207,8 +210,8 @@ def evaluate_demand_benchmarks(
                 "value": mv,
                 "unit": "ratio" if mk.startswith("r2") or mk.endswith("ape") else "units",
                 "benchmark_source_id": "makridakis2022" if "wmape" in mk or "mape" in mk else source_id,
-                "pass": beat_naive if model_name == "lightgbm_v2" and mk == "wmape" else "",
-                "notes": "Beat best naive WMAPE" if model_name == "lightgbm_v2" and mk == "wmape" else "",
+                "pass": beat_naive if model_name == "lightgbm_v3" and mk == "wmape" else "",
+                "notes": "Beat best naive WMAPE" if model_name == "lightgbm_v3" and mk == "wmape" else "",
             })
 
         for cat in test_df["category"].unique():
@@ -263,7 +266,7 @@ def evaluate_simulator_monotonicity(
     if not MODEL_PATH.exists():
         return pd.DataFrame([{
             "section": "simulator",
-            "model": "lightgbm_v2",
+            "model": "lightgbm_v3",
             "category": category,
             "metric": "monotonic_violation_rate",
             "value": float("nan"),
@@ -287,7 +290,7 @@ def evaluate_simulator_monotonicity(
 
     rows = [{
         "section": "simulator",
-        "model": "lightgbm_v2",
+        "model": "lightgbm_v3",
         "category": category,
         "metric": "monotonic_violation_rate",
         "value": violation_rate,
@@ -299,7 +302,7 @@ def evaluate_simulator_monotonicity(
     for p, d in zip(prices, demands):
         rows.append({
             "section": "simulator_curve",
-            "model": "lightgbm_v2",
+            "model": "lightgbm_v3",
             "category": category,
             "metric": "predicted_demand",
             "value": d,
@@ -328,12 +331,7 @@ def _median_price_index(category: str) -> int:
 
 
 def _pricing_strategies() -> Dict[str, Callable]:
-    return {
-        "random": lambda obs, env: env.action_space.sample(),
-        "low_price": lambda obs, env: 0,
-        "mid_price": lambda obs, env: N_PRICE_ACTIONS // 2,
-        "high_price": lambda obs, env: N_PRICE_ACTIONS - 1,
-    }
+    return default_pricing_strategies()
 
 
 def _run_pricing_episodes(
@@ -404,9 +402,12 @@ def evaluate_pricing_benchmarks(
 
         mid_profit = results.get("mid_price", {}).get("mean_profit", 0.0)
         rand_profit = results.get("random", {}).get("mean_profit", 0.0)
+        myopic_profit = results.get("myopic_oracle", {}).get("mean_profit", 0.0)
 
         for name, stats in results.items():
             source = "stable_baselines3" if name == "ppo" else "ferreira2016"
+            if name == "myopic_oracle":
+                source = "project_mvp_pricing"
             if name == "ppo":
                 source = "project_mvp_pricing"
             pass_flag = ""
@@ -416,6 +417,9 @@ def evaluate_pricing_benchmarks(
                     if stats["mean_profit"] > mid_profit and stats["mean_profit"] > rand_profit
                     else "fail"
                 )
+            beat_myopic = ""
+            if name == "ppo" and myopic_profit > 0:
+                beat_myopic = "yes" if stats["mean_profit"] >= myopic_profit * 0.95 else "no"
             for metric, val in stats.items():
                 rows.append({
                     "section": "pricing_simulator",
@@ -430,7 +434,8 @@ def evaluate_pricing_benchmarks(
                     "pass": pass_flag if name == "ppo" and metric == "mean_profit" else "",
                     "notes": (
                         f"{n_episodes} episodes x {EPISODE_LENGTH} days; "
-                        f"seed={seed}; demand={'LightGBM' if use_demand_model else 'analytical'}"
+                        f"seed={seed}; demand={'LightGBM v3' if use_demand_model else 'analytical'}"
+                        + (f"; vs_myopic={beat_myopic}" if name == "ppo" and metric == "mean_profit" else "")
                     ),
                 })
     return pd.DataFrame(rows)
@@ -531,12 +536,12 @@ def _build_markdown_report(
         f"- % ngày demand=0 (test): {demand_meta.get('pct_zero_demand_test', 0):.1%}",
         "",
         "**Benchmark demand** (theo [hyndman2021]): naive mean, category mean, lag-1, seasonal naive (DOW), ",
-        "Ridge cùng feature; **LightGBM v2** so với các baseline. ",
+        "Ridge cùng feature; **LightGBM v3** (Tweedie + lag demand) so với các baseline. ",
         f"Ngưỡng MVP nội bộ [project_mvp_demand]: **R² ≥ {DEMAND_R2_PASS}** trên test.",
         "",
         "**Benchmark pricing** (theo [ferreira2016], [sutton2018]): cùng `PricingEnv` + LightGBM simulator, ",
         f"{PRICING_EPISODES_DEFAULT} episode × {EPISODE_LENGTH} ngày; so Random / Low / Mid / High / ",
-        "median giá lịch sử / PPO (nếu có checkpoint). ",
+        "median giá lịch sử / **Myopic oracle** (greedy 1-step) / PPO (nếu có checkpoint). ",
         "Ngưỡng MVP [project_mvp_pricing]: PPO mean profit > mid-price và > random.",
         "",
     ]

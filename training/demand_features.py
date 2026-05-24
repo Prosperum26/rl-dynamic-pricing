@@ -18,12 +18,16 @@ import pandas as pd
 
 from config.constants import (
     DEFAULT_PRODUCT_CATEGORY,
+    DEMAND_LAG_DAYS,
     MODELS_DIR,
     PROCESSED_SALES_PATH,
     PRODUCT_CATEGORIES,
     RANDOM_SEED,
+    SIM_ELASTICITY_BLEND,
 )
 from training.simulation_context import (
+    apply_elasticity_calibration,
+    fit_category_demand_elasticity,
     fit_category_price_rules,
     infer_discount_rate,
     infer_transaction_count,
@@ -39,6 +43,11 @@ PROCESSED_REQUIRED_COLUMNS = [
 ]
 
 # Features always available at pricing time (plus category one-hot)
+LAG_FEATURE_COLS = [
+    "demand_lag1",
+    "demand_roll7_mean",
+]
+
 INFERENCE_FEATURE_COLS = [
     "price",
     "log_price",
@@ -53,6 +62,7 @@ INFERENCE_FEATURE_COLS = [
     "dow_cos",
     "month_sin",
     "month_cos",
+    *LAG_FEATURE_COLS,
 ]
 
 DEFAULT_PROCESSED_PATH = PROCESSED_SALES_PATH
@@ -98,6 +108,23 @@ def load_processed_sales(path: Path) -> pd.DataFrame:
     return df.sort_values("date").reset_index(drop=True)
 
 
+def add_demand_lag_features(
+    df: pd.DataFrame,
+    lag_days: int = DEMAND_LAG_DAYS,
+) -> pd.DataFrame:
+    """Per-category lag-1 and rolling mean demand (sorted by date)."""
+    out = df.sort_values(["category", "date"]).copy()
+    grouped = out.groupby("category", group_keys=False)
+    out["demand_lag1"] = grouped["demand"].shift(1)
+    out["demand_roll7_mean"] = grouped["demand"].transform(
+        lambda s: s.shift(1).rolling(lag_days, min_periods=1).mean()
+    )
+    cat_means = out.groupby("category")["demand"].transform("mean")
+    out["demand_lag1"] = out["demand_lag1"].fillna(cat_means)
+    out["demand_roll7_mean"] = out["demand_roll7_mean"].fillna(cat_means)
+    return out.sort_values("date").reset_index(drop=True)
+
+
 def time_based_split(
     df: pd.DataFrame,
     test_size: float = 0.2,
@@ -129,6 +156,7 @@ class DemandFeatureEncoder:
         self.category_stats_: Dict[str, Dict[str, float]] = {}
         self.global_stats_: Dict[str, float] = {}
         self.price_rules_: Dict[str, Dict[str, float]] = {}
+        self.elasticity_rules_: Dict[str, Dict[str, float]] = {}
 
     def fit(self, df: pd.DataFrame) -> "DemandFeatureEncoder":
         seen = sorted(df["category"].unique().tolist())
@@ -144,14 +172,17 @@ class DemandFeatureEncoder:
                 "median_price": float(sub["price"].median()),
                 "mean_discount_rate": float(sub["avg_discount_rate"].mean()),
                 "mean_transaction_count": float(sub["transaction_count"].mean()),
+                "mean_demand": float(sub["demand"].mean()),
             }
 
         self.global_stats_ = {
             "median_price": float(df["price"].median()),
             "mean_discount_rate": float(df["avg_discount_rate"].mean()),
             "mean_transaction_count": float(df["transaction_count"].mean()),
+            "mean_demand": float(df["demand"].mean()),
         }
         self.price_rules_ = fit_category_price_rules(df)
+        self.elasticity_rules_ = fit_category_demand_elasticity(df)
 
         self.feature_names_ = INFERENCE_FEATURE_COLS + [
             f"category_{c.replace(' ', '_').replace('&', 'and')}" for c in self.categories
@@ -160,6 +191,10 @@ class DemandFeatureEncoder:
 
     def _category_column_name(self, category: str) -> str:
         return f"category_{category.replace(' ', '_').replace('&', 'and')}"
+
+    def category_mean_demand(self, category: str) -> float:
+        stats = self.category_stats_.get(category, self.global_stats_)
+        return float(stats.get("mean_demand", self.global_stats_.get("mean_demand", 1.0)))
 
     def context_from_price(
         self,
@@ -239,7 +274,13 @@ class DemandFeatureEncoder:
         transaction_count: Optional[float] = None,
         is_weekend: Optional[int] = None,
         is_holiday_season: Optional[int] = None,
+        demand_lag1: Optional[float] = None,
+        demand_roll7_mean: Optional[float] = None,
     ) -> np.ndarray:
+        if demand_lag1 is None:
+            demand_lag1 = self.category_mean_demand(category)
+        if demand_roll7_mean is None:
+            demand_roll7_mean = demand_lag1
         if discount_rate is None or transaction_count is None:
             inferred_dr, inferred_txn = self.context_from_price(price, category)
             if discount_rate is None:
@@ -260,6 +301,8 @@ class DemandFeatureEncoder:
             "category": category,
             "avg_discount_rate": discount_rate,
             "transaction_count": transaction_count,
+            "demand_lag1": demand_lag1,
+            "demand_roll7_mean": demand_roll7_mean,
         }])
         return self.transform(row_df)
 
@@ -302,6 +345,8 @@ class DemandPredictorWrapper:
         category: str = DEFAULT_PRODUCT_CATEGORY,
         discount_rate: Optional[float] = None,
         transaction_count: Optional[float] = None,
+        demand_lag1: Optional[float] = None,
+        demand_roll7_mean: Optional[float] = None,
     ) -> float:
         features = self.encoder.build_row(
             price=price,
@@ -310,9 +355,21 @@ class DemandPredictorWrapper:
             category=category,
             discount_rate=discount_rate,
             transaction_count=transaction_count,
+            demand_lag1=demand_lag1,
+            demand_roll7_mean=demand_roll7_mean,
         )
         row = pd.DataFrame(features.reshape(1, -1), columns=self.encoder.feature_names_)
-        return float(max(0.0, self.model.predict(row)[0]))
+        raw = float(self.model.predict(row)[0])
+        elasticity_rules = getattr(self.encoder, "elasticity_rules_", {}) or {}
+        calibrated = apply_elasticity_calibration(
+            raw,
+            price,
+            category,
+            elasticity_rules,
+            self.encoder.global_stats_,
+            blend=SIM_ELASTICITY_BLEND,
+        )
+        return float(max(0.0, calibrated))
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         return self.model.predict(X)

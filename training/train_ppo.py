@@ -59,6 +59,7 @@ from training.ppo_paths import (
     normalize_category_arg,
     ppo_model_path,
 )
+from training.pricing_baselines import default_pricing_strategies
 
 
 def load_demand_predictor():
@@ -131,10 +132,11 @@ def compare_baselines(
     print("-" * 60)
 
     strategies = {
-        "Random": lambda obs, env: env.action_space.sample(),
-        "Low price": lambda obs, env: 0,
-        "Mid price": lambda obs, env: N_PRICE_ACTIONS // 2,
-        "High price": lambda obs, env: N_PRICE_ACTIONS - 1,
+        "Random": default_pricing_strategies()["random"],
+        "Low price": default_pricing_strategies()["low_price"],
+        "Mid price": default_pricing_strategies()["mid_price"],
+        "High price": default_pricing_strategies()["high_price"],
+        "Myopic": default_pricing_strategies()["myopic_oracle"],
     }
 
     results = {}

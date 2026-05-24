@@ -133,3 +133,65 @@ def demand_to_sales_units(demand: float, inventory: int) -> int:
         return 0
     requested = int(np.ceil(demand))
     return min(max(0, requested), max(0, inventory))
+
+
+def fit_category_demand_elasticity(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Fit log-log elasticity of demand vs price per category from historical rows.
+
+    Used to calibrate simulator predictions when the global model under-reacts to price.
+    """
+    rules: Dict[str, Dict[str, float]] = {}
+    for cat, sub in df.groupby("category"):
+        sub = sub.copy()
+        sub = sub[(sub["price"].astype(float) > 0) & (sub["demand"].astype(float) >= 0)]
+        median_price = float(sub["price"].median()) if len(sub) else 1.0
+        mean_demand = float(sub["demand"].mean()) if len(sub) else 1.0
+
+        if len(sub) >= 10:
+            log_p = np.log1p(sub["price"].astype(float))
+            log_d = np.log1p(sub["demand"].astype(float))
+            if log_p.std() > 1e-6:
+                coef = np.polyfit(log_p, log_d, 1)
+                elasticity = float(np.clip(coef[0], -1.5, 0.05))
+            else:
+                elasticity = -0.35
+        else:
+            elasticity = -0.35
+
+        rules[str(cat)] = {
+            "median_price": median_price,
+            "mean_demand": mean_demand,
+            "demand_elasticity": elasticity,
+        }
+    return rules
+
+
+def apply_elasticity_calibration(
+    raw_pred: float,
+    price: float,
+    category: str,
+    elasticity_rules: Dict[str, Dict[str, float]],
+    global_stats: Dict[str, float],
+    blend: float = 0.55,
+) -> float:
+    """
+    Softly adjust predicted demand using empirical price elasticity.
+
+    blend=0 leaves prediction unchanged; blend=1 applies full (price/median)^beta.
+    """
+    if raw_pred <= 0 or blend <= 0:
+        return max(0.0, raw_pred)
+
+    stats = elasticity_rules.get(category, {})
+    median = stats.get("median_price", global_stats.get("median_price", price))
+    beta = stats.get("demand_elasticity", -0.35)
+    if median <= 0:
+        return max(0.0, raw_pred)
+
+    ratio = max(float(price), 1.0) / median
+    factor = ratio ** beta
+    # dampen extreme adjustments
+    factor = float(np.clip(factor, 0.25, 2.5))
+    adjusted = raw_pred * (factor ** blend)
+    return max(0.0, float(adjusted))

@@ -565,6 +565,7 @@ elif page == "📊 Strategy comparison":
         "Low price": lambda obs, env: 0,
         "Mid price": lambda obs, env: N_PRICE_ACTIONS // 2,
         "High price": lambda obs, env: N_PRICE_ACTIONS - 1,
+        "Myopic oracle": lambda obs, env: env.select_myopic_action(),
     }
     if ppo_model is not None:
         strategies["PPO agent"] = lambda obs, env: int(

@@ -25,7 +25,7 @@ from config.constants import (
     DEFAULT_PRODUCT_CATEGORY, PRODUCT_CATEGORIES,
     OBS_DIM, N_CATEGORY_OBS,
     PRICE_STAGNATION_DAYS, PRICE_STAGNATION_PENALTY_USD,
-    PRICE_EXPLORATION_BONUS_USD,
+    PRICE_EXPLORATION_BONUS_USD, SIM_DAYS_PER_MONTH, DEMAND_LAG_DAYS,
 )
 from training.simulation_context import demand_to_sales_units
 
@@ -87,6 +87,10 @@ class PricingEnv(gym.Env):
         self._last_stagnation_penalty = 0.0
         self._last_exploration_bonus = 0.0
 
+        self._demand_lag1 = 0.0
+        self._demand_roll7_mean = 0.0
+        self._recent_demands: list[float] = []
+
         self._rng = np.random.default_rng(seed or RANDOM_SEED)
 
         self.history = {
@@ -136,6 +140,27 @@ class PricingEnv(gym.Env):
         info["exploration_bonus"] = self._last_exploration_bonus
         return info
 
+    def _default_lag_demand(self) -> float:
+        if self.demand_predictor is not None and hasattr(self.demand_predictor, "encoder"):
+            return self.demand_predictor.encoder.category_mean_demand(self.product_category)
+        return BASE_DEMAND
+
+    def _update_demand_lags(self, realized_demand: float) -> None:
+        self._recent_demands.append(float(realized_demand))
+        if len(self._recent_demands) > DEMAND_LAG_DAYS:
+            self._recent_demands = self._recent_demands[-DEMAND_LAG_DAYS:]
+        self._demand_lag1 = float(realized_demand)
+        if self._recent_demands:
+            self._demand_roll7_mean = float(np.mean(self._recent_demands))
+        else:
+            self._demand_roll7_mean = self._demand_lag1
+
+    def _reset_demand_lags(self) -> None:
+        mean_d = self._default_lag_demand()
+        self._demand_lag1 = mean_d
+        self._demand_roll7_mean = mean_d
+        self._recent_demands = []
+
     def _compute_demand(self, price: float) -> float:
         if self.demand_predictor is not None:
             if hasattr(self.demand_predictor, "predict_demand"):
@@ -144,6 +169,8 @@ class PricingEnv(gym.Env):
                     day_of_week=self.day_of_week,
                     month=self.month,
                     category=self.product_category,
+                    demand_lag1=self._demand_lag1,
+                    demand_roll7_mean=self._demand_roll7_mean,
                 )
             else:
                 features = np.array([[
@@ -173,6 +200,18 @@ class PricingEnv(gym.Env):
         stockouts = max(0, demand - sales)
         stockout_penalty = STOCKOUT_PENALTY * stockouts
         return revenue - cogs - holding_cost - stockout_penalty
+
+    def one_step_profit_for_action(self, action: int) -> float:
+        """Estimate profit for a candidate price action without mutating env state."""
+        price = PRICE_LEVELS[action]
+        demand = self._compute_demand(price)
+        sales = demand_to_sales_units(demand, self.inventory)
+        return self._compute_profit(price, demand, sales)
+
+    def select_myopic_action(self) -> int:
+        """Greedy policy: pick price level maximizing expected 1-step profit."""
+        profits = [self.one_step_profit_for_action(a) for a in range(N_PRICE_ACTIONS)]
+        return int(np.argmax(profits))
 
     def _pricing_incentives(self, action: int) -> Tuple[float, float]:
         """
@@ -236,6 +275,7 @@ class PricingEnv(gym.Env):
         self._days_at_same_price = 0
         self._last_stagnation_penalty = 0.0
         self._last_exploration_bonus = 0.0
+        self._reset_demand_lags()
 
         self.history = {
             "prices": [],
@@ -282,9 +322,11 @@ class PricingEnv(gym.Env):
         self.history["inventory"].append(self.inventory)
         self.history["price_actions"].append(action)
 
+        self._update_demand_lags(self._last_demand)
+
         self.current_day += 1
         self.day_of_week = (self.day_of_week + 1) % 7
-        if self.current_day > 0 and self.current_day % 30 == 0:
+        if self.current_day > 0 and self.current_day % SIM_DAYS_PER_MONTH == 0:
             self.month = (self.month % 12) + 1
 
         terminated = self.current_day >= EPISODE_LENGTH

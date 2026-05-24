@@ -109,6 +109,9 @@ DEMAND_NOISE_STD = 5.0
 # RL ENVIRONMENT CONFIGURATION
 # =============================================================================
 
+# Simulated calendar: advance month every N days within an episode
+SIM_DAYS_PER_MONTH = 7
+
 # Episode length (days per episode)
 EPISODE_LENGTH = 30
 
@@ -183,12 +186,22 @@ EVAL_FREQ = 5000
 EVAL_EPISODES = 10
 
 # =============================================================================
+# DEMAND LAG / SIMULATION CALIBRATION
+# =============================================================================
+
+DEMAND_LAG_DAYS = 7
+
+# Blend empirical price elasticity into simulator predictions (0=off, 1=full)
+SIM_ELASTICITY_BLEND = 0.55
+
+# =============================================================================
 # LIGHTGBM CONFIGURATION
 # =============================================================================
 
-# Model hyperparameters (tuned for sparse daily conversion counts)
+# Tweedie regression suits sparse non-negative demand counts (mass at zero)
 LGB_PARAMS = {
-    "objective": "regression",
+    "objective": "tweedie",
+    "tweedie_variance_power": 1.5,
     "metric": "rmse",
     "boosting_type": "gbdt",
     "n_estimators": 500,

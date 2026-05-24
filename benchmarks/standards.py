@@ -84,7 +84,8 @@ BENCHMARK_SOURCES: List[BenchmarkSource] = [
         url="",
         used_for=(
             "Pass criterion: mean 30-day episode profit > fixed mid-price policy "
-            "and > random pricing, same PricingEnv + LightGBM demand simulator."
+            "and > random pricing, same PricingEnv + LightGBM demand simulator. "
+            "Myopic oracle (greedy 1-step profit) as strong non-RL baseline."
         ),
     ),
 ]
